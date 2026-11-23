@@ -1,5 +1,7 @@
 # xgrammar-zig
 
+**English** | [中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 Pure-Zig (**Zig 0.17.1**, zero external dependencies) port of **xgrammar-rs 0.2.8** (XGrammar-2 architecture) for grammar-constrained LLM decoding (JSON Schema / EBNF / Regex / Lark / Structural Tag -> token bitmask & logit masking), with idiomatic Zig 0.17 APIs and full bit-for-bit parity against the Rust reference oracle.
 
 ## Features
