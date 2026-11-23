@@ -203,8 +203,7 @@ pub const GrammarFsmBuilder = struct {
     pub fn token_tag_dispatch(allocator: Allocator, ttd: *const TokenTagDispatch) Allocator.Error!FsmWithStartEnd {
         var fsm = try Fsm.new(allocator, 1);
         errdefer fsm.deinit();
-        var ends = try build_token_tag_dispatch(&fsm, ttd, 0);
-        defer ends.deinit(allocator);
+        const ends = try build_token_tag_dispatch(&fsm, ttd, 0);
         return FsmWithStartEnd.new(allocator, fsm, 0, ends, false);
     }
 
