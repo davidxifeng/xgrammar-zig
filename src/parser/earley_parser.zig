@@ -271,35 +271,15 @@ pub const EarleyParser = struct {
         if (comptime !grammar_fsm_installed) return error.FsmNotInstalled;
         const idx: usize = @intCast(rule_id);
         if (idx >= self.grammar.per_rule_fsms.items.len) return error.FsmNotInstalled;
-        const view = self.grammar.per_rule_fsms.items[idx] orelse return error.FsmNotInstalled;
-        return &view.fsm;
+        return if (self.grammar.per_rule_fsms.items[idx]) |*view| &view.fsm else return error.FsmNotInstalled;
     }
 
     /// Computes `Grammar::fsm_state_offsets` (grammar.rs L72) into `self.fsm_state_offsets`:
     /// distinct FSM storages get consecutive state ranges; shared rule views reuse one range.
     fn init_fsm_state_offsets(self: *EarleyParser) (FsmGateError || Allocator.Error)!void {
         if (comptime !grammar_fsm_installed) return error.FsmNotInstalled;
-        self.fsm_state_offsets.clearRetainingCapacity();
-        var storage: ArrayList(fsm_mod.CompactFsm) = .empty;
-        defer storage.deinit(self.gpa);
-        const shared_complete = self.grammar.complete_fsm;
-        try storage.append(self.gpa, shared_complete);
-        var next_offset = @as(usize, @intCast(complete.num_states()));
-        try self.fsm_state_offsets.append(self.gpa, 0);
-        for (self.grammar.per_rule_fsms.items) |view| {
-            const offset = blk: {
-                const wrapper = view orelse break :blk 0;
-                const fsm = wrapper.fsm.get_fsm();
-                for (storage.items, 0..) |shared, i| {
-                    if (fsm.shares_storage(shared)) break :blk self.fsm_state_offsets.items[i];
-                }
-                const offset = next_offset;
-                next_offset += @as(usize, @intCast(fsm.num_states()));
-                storage.append(self.gpa, fsm) catch unreachable;
-                break :blk offset;
-            };
-            try self.fsm_state_offsets.append(self.gpa, offset);
-        }
+        self.fsm_state_offsets.deinit(self.gpa);
+        self.fsm_state_offsets = try self.grammar.fsm_state_offsets(self.gpa);
     }
 
     /// Collects the captured rule occurrences whose concrete Earley parent chains contain the
@@ -959,8 +939,9 @@ pub const EarleyParser = struct {
                 // Check whether the partial codepoint could still match any range. Negative
                 // classes always continue and verify on the final byte.
                 const remaining_bytes = new_state.sub_element_id;
-                const min_codepoint = new_state.partial_codepoint << @intCast(6 * remaining_bytes);
-                const max_codepoint = min_codepoint | ((1 << @intCast(6 * remaining_bytes)) - 1);
+                const shift: u5 = @intCast(6 * remaining_bytes);
+                const min_codepoint = new_state.partial_codepoint << shift;
+                const max_codepoint = min_codepoint | ((@as(i32, 1) << shift) - 1);
                 if (is_negative or ranges_overlap(class_data, min_codepoint, max_codepoint)) {
                     try self.tmp_states_to_be_added.append(self.gpa, new_state);
                 }
@@ -972,9 +953,9 @@ pub const EarleyParser = struct {
         if (ch >= 0x80) {
             const decoded = support.encoding.handle_utf8_first_byte(ch) orelse return;
             std.debug.assert(decoded.consumed > 1);
-            const remaining: u5 = @intCast(6 * (@as(i32, decoded.consumed) - 1));
+            const remaining: u5 = @intCast(6 * (@as(i32, @intCast(decoded.consumed)) - 1));
             const min_codepoint = decoded.codepoint << remaining;
-            const max_codepoint = min_codepoint | ((1 << remaining) - 1);
+            const max_codepoint = min_codepoint | ((@as(i32, 1) << remaining) - 1);
             if (is_negative or ranges_overlap(class_data, min_codepoint, max_codepoint)) {
                 var new_state = state;
                 new_state.sub_element_id = @as(i32, @intCast(decoded.consumed)) - 1;
@@ -1206,17 +1187,17 @@ pub const EarleyParser = struct {
 
     /// A human-readable dump of the latest scanable states (caller owns).
     pub fn print_states(self: *const EarleyParser, gpa: Allocator) Allocator.Error![]u8 {
-        var result: ArrayList(u8) = .empty;
-        errdefer result.deinit(gpa);
-        const w = result.writer(gpa);
-        try w.print("There are {d} steps in history. Last step: [\n", .{self.scanable_state_history.len()});
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        const w = &out.writer;
+        w.print("There are {d} steps in history. Last step: [\n", .{self.scanable_state_history.len()}) catch return error.OutOfMemory;
         for (self.scanable_state_history.back()) |state| {
             const text = try state.display(gpa);
             defer gpa.free(text);
-            try w.print("{s}, \n", .{text});
+            w.print("{s}, \n", .{text}) catch return error.OutOfMemory;
         }
-        try result.appendSlice(gpa, "]");
-        return result.toOwnedSlice(gpa);
+        w.writeAll("]") catch return error.OutOfMemory;
+        return gpa.dupe(u8, out.written());
     }
 };
 

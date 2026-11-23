@@ -69,6 +69,43 @@ pub const TokenizerInfo = struct {
         parent.destroy(self.arena);
     }
 
+    /// Deep-copies `self` into an independent `ArenaAllocator` backed by `allocator`.
+    pub fn clone(self: *const TokenizerInfo, allocator: Allocator) Allocator.Error!TokenizerInfo {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const decoded_copy = try a.alloc([]const u8, self.decoded_vocab.len);
+        for (self.decoded_vocab, 0..) |bytes, i| {
+            decoded_copy[i] = try a.dupe(u8, bytes);
+        }
+        const sorted_copy = try a.alloc(SortedDecodedToken, self.sorted_decoded_vocab.len);
+        for (self.sorted_decoded_vocab, 0..) |entry, i| {
+            const token_slice = if (entry.id >= 0 and @as(usize, @intCast(entry.id)) < decoded_copy.len and std.mem.eql(u8, decoded_copy[@intCast(entry.id)], entry.token))
+                decoded_copy[@intCast(entry.id)]
+            else
+                try a.dupe(u8, entry.token);
+            sorted_copy[i] = .{ .id = entry.id, .token = token_slice };
+        }
+
+        return .{
+            .arena = arena,
+            .vocab_type = self.vocab_type,
+            .vocab_size = self.vocab_size,
+            .add_prefix_space = self.add_prefix_space,
+            .decoded_vocab = decoded_copy,
+            .sorted_decoded_vocab = sorted_copy,
+            .trie_subtree_nodes_range = try a.dupe(i32, self.trie_subtree_nodes_range),
+            .stop_token_ids = try a.dupe(i32, self.stop_token_ids),
+            .special_token_ids = try a.dupe(i32, self.special_token_ids),
+            .token_id_to_sorted_vocab_index = try a.dupe(i32, self.token_id_to_sorted_vocab_index),
+            .token_char_counts = try a.dupe(i32, self.token_char_counts),
+            .max_token_chars = self.max_token_chars,
+        };
+    }
+
     /// Constructs the tokenizer info.
     ///
     /// `encoded_vocab` is the encoded vocabulary of the tokenizer.
@@ -298,7 +335,7 @@ pub const TokenizerInfo = struct {
         return metadata_value_into(self.arena.allocator(), self) catch @panic("OOM");
     }
 
-    fn metadata_value_into(a: Allocator, self: *const TokenizerInfo) error{OutOfMemory}!std.json.Value {
+    pub fn metadata_value_into(a: Allocator, self: *const TokenizerInfo) error{OutOfMemory}!std.json.Value {
         var obj = std.json.ObjectMap{};
         // serde_json serializes maps with lexicographically sorted keys.
         try obj.put(a, "add_prefix_space", .{ .bool = self.add_prefix_space });
@@ -317,18 +354,30 @@ pub const TokenizerInfo = struct {
 
     /// Returns an error when `metadata` does not match this tokenizer info.
     pub fn check_metadata_match(
-        self: *TokenizerInfo,
+        self: *const TokenizerInfo,
         metadata: std.json.Value,
         diag: ?*DeserializeErrorInfo,
     ) DeserializeError!void {
-        const expected = self.metadata_value();
-        inline for ([_][]const u8{ "vocab_type", "vocab_size", "add_prefix_space", "stop_token_ids" }) |key| {
-            const exp = get_field(expected, key);
-            const got = get_field(metadata, key);
-            if (!json_value_eql(exp, got)) {
-                if (diag) |d| d.* = .{ .Format = "tokenizer metadata mismatch" };
+        const fail = struct {
+            fn f(d: ?*DeserializeErrorInfo) DeserializeError {
+                if (d) |dd| dd.* = .{ .Format = "tokenizer metadata mismatch" };
                 return error.Format;
             }
+        }.f;
+        const obj = switch (metadata) {
+            .object => |o| o,
+            else => return fail(diag),
+        };
+        const vt = obj.get("vocab_type") orelse return fail(diag);
+        if (vt != .integer or vt.integer != @as(i64, @intFromEnum(self.vocab_type))) return fail(diag);
+        const vs = obj.get("vocab_size") orelse return fail(diag);
+        if (vs != .integer or vs.integer != @as(i64, self.vocab_size)) return fail(diag);
+        const aps = obj.get("add_prefix_space") orelse return fail(diag);
+        if (aps != .bool or aps.bool != self.add_prefix_space) return fail(diag);
+        const st = obj.get("stop_token_ids") orelse return fail(diag);
+        if (st != .array or st.array.items.len != self.stop_token_ids.len) return fail(diag);
+        for (st.array.items, self.stop_token_ids) |got, exp| {
+            if (got != .integer or got.integer != @as(i64, exp)) return fail(diag);
         }
     }
 

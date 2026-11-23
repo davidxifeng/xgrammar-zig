@@ -30,7 +30,7 @@
 ## Wave D(compiler)
 | Rust 文件 | Zig 文件 | 状态 |
 |---|---|---|
-| compiler/* (token_mask_cache_builder 859、grammar_compiler 415、adaptive_token_mask 347、rule_level_cache 164、compiled_grammar 188、tag_dispatch_optimization) | src/compiler/* | ☐ |
+| compiler/* (token_mask_cache_builder 859、grammar_compiler 415、adaptive_token_mask 347、rule_level_cache 164、compiled_grammar 188、tag_dispatch_optimization) | src/compiler/* (8 文件) | 🔗 已接线(203 过 + 1 待 matcher 门控,0 失败,0 泄漏;lark cache 与 earley fsm gate 已解锁) |
 
 ## Wave E(matcher + API + parity)
 | Rust 文件 | Zig 文件 | 状态 |

@@ -255,3 +255,10 @@
    - 补齐 4 个 XML converter 文件(`xml_converter.zig`、`xml_tool_calling_converter.zig`、`cohere_xml_tool_calling_converter.zig`、`minimax_m3_xml_tool_calling_converter.zig`)并在 `json_schema_converter.zig` 接通 `.MiniMaxM3Xml` / `.CohereXml` / `XmlToolCallingConverter`,`NotImplementedInWaveLark` 全数消除。
    - 错误与诊断:Schema/Lark/StructuralTag/XML 等错误遵循 `error{...} + *ErrorInfo` 诊断出参约定;所有公开 `from_*` 返回由调用方负责 `deinit()` 的 `*Grammar`。
    - `fsm/regex_ir.zig` 与 `functor/{grammar_fsm_builder,regular_grammar_fsm_builder,repetition_range_expander}.zig` 修复了 3 处中间缓冲/FSM 泄漏及重复区间优化回归,`std.testing.allocator` 下全波零泄漏(196 过 + 3 待后续波次解锁的 SkipZigTest)。
+
+8. **compiler 波次(WaveCompiler)**:
+   - 新增 `src/compiler/{error,tag_dispatch_optimization,adaptive_token_mask,rule_level_cache,token_mask_cache_builder,compiled_grammar,grammar_compiler,mod}.zig`,并在 `src/xgrammar.zig` 暴露 `pub const compiler`。
+   - `CompiledGrammar` 内部以 `CompiledGrammarShared`(原子引用计数 `refs: std.atomic.Value(usize)`)持有 `grammar`、`tokenizer_info` 与 `adaptive_token_mask_cache`,`clone()` 为 O(1) 原子增引用,`shares_storage` 逐字节对应 Rust `Arc::ptr_eq`,使 `GrammarCompiler` 缓存命中语义完全一致。
+   - `RuleLevelCache`(16 分片)与 `GrammarCompiler` 的 `CacheState` 使用 `std.atomic.Mutex` 自旋互斥(Zig 0.17 `std.Thread` 无无 `Io` 互斥锁)。
+   - `TokenizerInfo` 增补 `clone()` 并使 `check_metadata_match` 支持 `*const TokenizerInfo` 且零分配;顺带修复 `parser/earley_parser.zig`(`init_fsm_state_offsets` 与 `per_rule_fsm` 悬垂栈引用等潜伏 bug)与 `functor/grammar_fsm_hasher.zig`(BFS 访问重入、`hash_and_target` 类型与 `StateIdMap` 传参)。
+   - 序列化 JSON 键按字典序插入(`__VERSION__` < `adaptive_token_mask_cache` < `grammar` < `tokenizer_metadata`,`AdaptiveTokenMask` 内同排序),`build_adaptive_token_mask_cache` 在直译期保持串行并将 `reachable_states` 升序排列以保证确定性(多线程化保留到 Milestone 4)。

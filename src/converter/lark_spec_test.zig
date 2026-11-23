@@ -168,7 +168,58 @@ test "named grammar cycle" {
 }
 
 test "grammar compiler caches lark sources" {
-    return error.SkipZigTest; // needs the compiler wave (`GrammarCompiler.compile_lark`)
+    const compiler_mod = @import("../compiler/mod.zig");
+    const GrammarCompiler = compiler_mod.GrammarCompiler;
+
+    const vocab = [_][]const u8{ "a", "b", "c", "item" };
+    var tokenizer_info = try TokenizerInfo.new(allocator, &vocab, .Raw, 4, &.{}, false, null);
+    defer tokenizer_info.deinit();
+
+    const compiler_inst = try GrammarCompiler.new(allocator, &tokenizer_info, 1, true, -1);
+    defer compiler_inst.deinit();
+
+    var first = try compiler_inst.compile_lark("start: \"a\"", &.{}, null);
+    defer first.deinit();
+    var repeated = try compiler_inst.compile_lark("start: \"a\"", &.{}, null);
+    defer repeated.deinit();
+    try std.testing.expect(first.shares_storage(&repeated));
+
+    var named_grammars = [_]NamedGrammar{
+        lark_source("left", "start: \"a\""),
+        lark_source("right", "start: \"b\""),
+    };
+    var with_named_grammars = try compiler_inst.compile_lark("start: @left @right", &named_grammars, null);
+    defer with_named_grammars.deinit();
+    var reversed = [_]NamedGrammar{ named_grammars[1], named_grammars[0] };
+    var with_reordered_named_grammars = try compiler_inst.compile_lark("start: @left @right", &reversed, null);
+    defer with_reordered_named_grammars.deinit();
+    try std.testing.expect(with_named_grammars.shares_storage(&with_reordered_named_grammars));
+
+    const diff_named = [_]NamedGrammar{
+        lark_source("left", "start: \"a\""),
+        lark_source("right", "start: \"c\""),
+    };
+    var with_different_named_grammar = try compiler_inst.compile_lark("start: @left @right", &diff_named, null);
+    defer with_different_named_grammar.deinit();
+    try std.testing.expect(!with_named_grammars.shares_storage(&with_different_named_grammar));
+
+    const item1 = try lark_converter.from_lark(allocator, "start: \"item\"", null, &.{}, null);
+    defer item1.deinit();
+    const item2 = try lark_converter.from_lark(allocator, "start: \"item\"", null, &.{}, null);
+    defer item2.deinit();
+    var with_grammar_object = try compiler_inst.compile_lark("start: @item", &.{lark_grammar("item", item1)}, null);
+    defer with_grammar_object.deinit();
+    var with_equivalent_grammar_object = try compiler_inst.compile_lark("start: @item", &.{lark_grammar("item", item2)}, null);
+    defer with_equivalent_grammar_object.deinit();
+    try std.testing.expect(with_grammar_object.shares_storage(&with_equivalent_grammar_object));
+
+    const uncached_compiler = try GrammarCompiler.new(allocator, &tokenizer_info, 1, false, -1);
+    defer uncached_compiler.deinit();
+    var uncached_first = try uncached_compiler.compile_lark("start: \"a\"", &.{}, null);
+    defer uncached_first.deinit();
+    var uncached_second = try uncached_compiler.compile_lark("start: \"a\"", &.{}, null);
+    defer uncached_second.deinit();
+    try std.testing.expect(!uncached_first.shares_storage(&uncached_second));
 }
 
 test "dynamic tool call lowers to tag dispatch" {

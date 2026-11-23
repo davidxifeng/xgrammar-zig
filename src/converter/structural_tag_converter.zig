@@ -201,9 +201,21 @@ fn resolve_format(gpa: Allocator, diag: ?*?StructuralTagErrorInfo, format: *Form
 
 fn end_strings_of(gpa: Allocator, nearest_tag_end: ?*const TagEnd) StructuralTagError!std.ArrayList([]const u8) {
     var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |s| gpa.free(s);
+        out.deinit(gpa);
+    }
     if (nearest_tag_end) |end| {
         switch (end.*) {
-            .strings => |v| out.appendSlice(gpa, v.items) catch return error.OutOfMemory,
+            .strings => |v| {
+                for (v.items) |s| {
+                    const duped = gpa.dupe(u8, s) catch return error.OutOfMemory;
+                    out.append(gpa, duped) catch |err| {
+                        gpa.free(duped);
+                        return err;
+                    };
+                }
+            },
             else => {},
         }
     }
@@ -268,6 +280,7 @@ fn analyze(gpa: Allocator, diag: ?*?StructuralTagErrorInfo, format: *Format, nea
         .any_text => |*f| {
             var detected = try end_strings_of(gpa, nearest_tag_end);
             std.mem.swap(std.ArrayList([]const u8), &detected, &f.detected_end_strs);
+            for (detected.items) |s| gpa.free(s);
             detected.deinit(gpa);
         },
         .exclude_token => |*f| {
@@ -303,6 +316,7 @@ fn analyze(gpa: Allocator, diag: ?*?StructuralTagErrorInfo, format: *Format, nea
             }
             var detected = try end_strings_of(gpa, nearest_tag_end);
             std.mem.swap(std.ArrayList([]const u8), &detected, &f.detected_end_strs);
+            for (detected.items) |s| gpa.free(s);
             detected.deinit(gpa);
         },
         .tags_with_separator => |*f| {

@@ -43,12 +43,11 @@ pub const TrieFsmBuilder = struct {
         var ends = StateSet.init(allocator);
         defer ends.deinit();
         var collected_ends: std.ArrayList(i32) = .empty;
-        errdefer collected_ends.deinit(allocator);
+        defer collected_ends.deinit(allocator);
 
         for (patterns) |pattern| {
             const end = try insert_pattern(&fsm, pattern, &ends, allow_overlap) orelse {
                 fsm.deinit();
-                collected_ends.deinit(allocator);
                 return null;
             };
             try ends.put(end, {});
@@ -61,7 +60,6 @@ pub const TrieFsmBuilder = struct {
             for (excluded_patterns) |pattern| {
                 const end = try insert_pattern(&fsm, pattern, &ends, allow_overlap) orelse {
                     fsm.deinit();
-                    collected_ends.deinit(allocator);
                     return null;
                 };
                 try ends.put(end, {});

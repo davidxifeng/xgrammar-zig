@@ -51,7 +51,7 @@ pub fn apply(allocator: Allocator, grammar: *Grammar) Allocator.Error!void {
         .fsm_state_offsets = .empty,
         .per_rule_fsm_hashes = .empty,
         .per_rule_fsm_new_state_ids = .empty,
-        .ready_queue = undefined,
+        .ready_queue = .empty,
     };
     defer hasher.deinit_temps();
     try hasher.apply();
@@ -97,7 +97,7 @@ const GrammarFsmHasher = struct {
         try self.per_rule_fsm_new_state_ids.appendNTimes(gpa, &.{}, num_rules);
         try self.visited.appendNTimes(gpa, false, num_rules);
         {
-            const offsets = try self.grammar.fsm_state_offsets(gpa);
+            var offsets = try self.grammar.fsm_state_offsets(gpa);
             defer offsets.deinit(gpa);
             try self.fsm_state_offsets.appendSlice(gpa, offsets.items);
         }
@@ -144,7 +144,6 @@ const GrammarFsmHasher = struct {
 
         // Hash the FSMs which can be hashed: terminal FSMs, or self-recursion FSMs. When no
         // FSM is ready, try to break a simple cycle in the reference graph and continue.
-        self.ready_queue = std.Deque(i32).init(gpa);
         for (0..num_rules) |rule_id| {
             if (self.is_ready_to_hash(@intCast(rule_id))) try self.ready_queue.pushBack(gpa, @intCast(rule_id));
         }
@@ -304,7 +303,8 @@ const GrammarFsmHasher = struct {
     }
 
     /// Per-state `(hash, target)` candidates, iterated in sorted order (Rust `BTreeSet`).
-    const HashTargetList = std.ArrayList(struct { hash: i32, target: i32 });
+    const HashI32TargetList = std.ArrayList(struct { hash: i32, target: i32 });
+    const HashU64TargetList = std.ArrayList(struct { hash: u64, target: i32 });
 
     /// The per-rule mapping state: old id → new id (new ids assigned in BFS discovery
     /// order, like Rust inserts into a `BTreeMap` and sizes by entry count); the output
@@ -315,7 +315,7 @@ const GrammarFsmHasher = struct {
 
         fn init(gpa: Allocator, start: i32) Allocator.Error!StateIdMap {
             var map = StateIdMap{ .lookup = std.AutoHashMap(i32, i32).init(gpa), .order = .empty };
-            try map.lookup.put(gpa, start, 0);
+            try map.lookup.put(start, 0);
             try map.order.append(gpa, start);
             return map;
         }
@@ -333,19 +333,20 @@ const GrammarFsmHasher = struct {
             return self.lookup.get(old).?;
         }
 
-        fn get_or_insert(self: *StateIdMap, gpa: Allocator, old: i32) Allocator.Error!i32 {
-            if (self.lookup.get(old)) |new_id| return new_id;
+        fn get_or_insert(self: *StateIdMap, gpa: Allocator, old: i32) Allocator.Error!struct { id: i32, inserted: bool } {
+            if (self.lookup.get(old)) |new_id| return .{ .id = new_id, .inserted = false };
             const new_id: i32 = @intCast(self.lookup.count());
-            try self.lookup.put(gpa, old, new_id);
+            try self.lookup.put(old, new_id);
             try self.order.append(gpa, old);
-            return new_id;
+            return .{ .id = new_id, .inserted = true };
         }
     };
 
     /// Sorts and dedups `(hash, target)` candidates (Rust `BTreeSet` iteration).
-    fn sort_hash_targets(list: *HashTargetList) void {
-        std.mem.sort(@TypeOf(list.items[0]), list.items, {}, struct {
-            fn less(_: void, a: @TypeOf(list.items[0]), b: @TypeOf(list.items[0])) bool {
+    fn sort_hash_targets(list: anytype) void {
+        const Elem = @TypeOf(list.items[0]);
+        std.mem.sort(Elem, list.items, {}, struct {
+            fn less(_: void, a: Elem, b: Elem) bool {
                 return a.hash < b.hash or (a.hash == b.hash and a.target < b.target);
             }
         }.less);
@@ -370,7 +371,7 @@ const GrammarFsmHasher = struct {
         var bfs_queue: std.Deque(i32) = .empty;
         defer bfs_queue.deinit(gpa);
         try bfs_queue.pushBack(gpa, wse.get_start());
-        var hash_and_target = HashTargetList.empty;
+        var hash_and_target = HashU64TargetList.empty;
         defer hash_and_target.deinit(gpa);
 
         while (bfs_queue.popFront()) |current_old_state_id| {
@@ -414,16 +415,16 @@ const GrammarFsmHasher = struct {
 
             sort_hash_targets(&hash_and_target);
             for (hash_and_target.items) |candidate| {
-                const target_new_id = try state_map.get_or_insert(gpa, candidate.target);
-                try bfs_queue.pushBack(gpa, candidate.target);
-                hash_result = hash_combine(hash_result, &.{ @bitCast(@as(i64, current_new_state_id)), @bitCast(@as(i64, candidate.hash)), @bitCast(@as(i64, target_new_id)) });
+                const res = try state_map.get_or_insert(gpa, candidate.target);
+                if (res.inserted) try bfs_queue.pushBack(gpa, candidate.target);
+                hash_result = hash_combine(hash_result, &.{ @bitCast(@as(i64, current_new_state_id)), candidate.hash, @bitCast(@as(i64, res.id)) });
             }
 
             for (self.sorted_edges.items[offset + @as(usize, @intCast(current_old_state_id))].items) |edge| {
+                const res = try state_map.get_or_insert(gpa, edge.target);
+                if (res.inserted) try bfs_queue.pushBack(gpa, edge.target);
                 if (edge.is_rule_ref() or edge.is_repeat_ref()) continue;
-                const target_new_id = try state_map.get_or_insert(gpa, edge.target);
-                try bfs_queue.pushBack(gpa, edge.target);
-                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, edge.min, edge.max, target_new_id });
+                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, edge.min, edge.max, res.id });
             }
         }
 
@@ -437,7 +438,7 @@ const GrammarFsmHasher = struct {
     /// rule-like edge can contribute, recording its `(hash, target)` candidate.
     fn hash_rule_like_edge(
         self: *GrammarFsmHasher,
-        hash_and_target: *HashTargetList,
+        hash_and_target: *HashU64TargetList,
         unhashed_rules_count: *i32,
         is_start: bool,
         fsm_index: i32,
@@ -446,18 +447,18 @@ const GrammarFsmHasher = struct {
     ) Allocator.Error!bool {
         const gpa = self.allocator;
         if (ref_rule_id == fsm_index) {
-            try hash_and_target.append(gpa, .{ .hash = SELF_RECURSION_FLAG, .target = target });
+            try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(i64, SELF_RECURSION_FLAG)), .target = target });
             return true;
         }
         if (self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)] == null) {
             if (!is_start) return false;
             unhashed_rules_count.* += 1;
             if (unhashed_rules_count.* > 1) return false;
-            try hash_and_target.append(gpa, .{ .hash = UNKNOWN_FLAG, .target = target });
+            try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(i64, UNKNOWN_FLAG)), .target = target });
             return true;
         }
         const hash: u64 = self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)].?;
-        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(i64, @as(u32, @truncate(hash)))), .target = target });
+        try hash_and_target.append(gpa, .{ .hash = hash, .target = target });
         return true;
     }
 
@@ -472,7 +473,7 @@ const GrammarFsmHasher = struct {
         var bfs_queue: std.Deque(i32) = .empty;
         defer bfs_queue.deinit(gpa);
         try bfs_queue.pushBack(gpa, wse.get_start());
-        var hash_and_target = HashTargetList.empty;
+        var hash_and_target = HashI32TargetList.empty;
         defer hash_and_target.deinit(gpa);
 
         while (bfs_queue.popFront()) |current_old_state_id| {
@@ -493,35 +494,35 @@ const GrammarFsmHasher = struct {
                     } else {
                         std.debug.assert(self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)] != null);
                         const hash: u64 = self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)].?;
-                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(i64, @as(u32, @truncate(hash)))), .target = edge.target });
+                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(u32, @truncate(hash))), .target = edge.target });
                     }
                 } else if (edge.is_repeat_ref()) {
                     const info = wse.get_fsm().repeat_edge_info(edge.aux_index());
                     const ref_rule_id = info.rule_id();
                     if (ref_rule_id == fsm_index) {
                         const repeat_hash = hash_combine_i32(@bitCast(@as(i64, SELF_RECURSION_FLAG)), &.{ info.lower(), info.upper() });
-                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(i64, @as(u32, @truncate(repeat_hash)))), .target = edge.target });
+                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(u32, @truncate(repeat_hash))), .target = edge.target });
                     } else {
                         std.debug.assert(self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)] != null);
                         const base_hash: u64 = self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)].?;
                         const repeat_hash = hash_combine_i32(base_hash, &.{ info.lower(), info.upper() });
-                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(i64, @as(u32, @truncate(repeat_hash)))), .target = edge.target });
+                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(u32, @truncate(repeat_hash))), .target = edge.target });
                     }
                 }
             }
 
             sort_hash_targets(&hash_and_target);
             for (hash_and_target.items) |candidate| {
-                const target_new_id = try state_map.get_or_insert(gpa, candidate.target);
-                try bfs_queue.pushBack(gpa, candidate.target);
-                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, candidate.hash, target_new_id });
+                const res = try state_map.get_or_insert(gpa, candidate.target);
+                if (res.inserted) try bfs_queue.pushBack(gpa, candidate.target);
+                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, candidate.hash, res.id });
             }
 
             for (self.sorted_edges.items[offset + @as(usize, @intCast(current_old_state_id))].items) |edge| {
+                const res = try state_map.get_or_insert(gpa, edge.target);
+                if (res.inserted) try bfs_queue.pushBack(gpa, edge.target);
                 if (edge.is_rule_ref() or edge.is_repeat_ref()) continue;
-                const target_new_id = try state_map.get_or_insert(gpa, edge.target);
-                try bfs_queue.pushBack(gpa, edge.target);
-                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, edge.min, edge.max, target_new_id });
+                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, edge.min, edge.max, res.id });
             }
         }
 

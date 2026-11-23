@@ -86,7 +86,9 @@ fn validate_lazy_rules(allocator: Allocator, grammar: *const Grammar, diag: ?*Fu
             .Regex, .Substring => continue,
             .Choices => {},
             else => {
-                error_mod.set_diag(diag, .{ .LazyRuleBodyNotChoices = rule.name });
+                if (diag != null) {
+                    error_mod.set_diag(diag, .{ .LazyRuleBodyNotChoices = try allocator.dupe(u8, rule.name) });
+                }
                 return error.LazyRuleBodyNotChoices;
             },
         }
@@ -96,13 +98,14 @@ fn validate_lazy_rules(allocator: Allocator, grammar: *const Grammar, diag: ?*Fu
             for (choice.data) |element_id| {
                 const element_ty = grammar.expr(element_id).ty;
                 if (element_ty != .ByteString and element_ty != .CharacterClass and element_ty != .CharacterClassStar) {
-                    error_mod.set_diag(diag, .{ .LazyRuleElementNotTerminal = rule.name });
+                    if (diag != null) {
+                        error_mod.set_diag(diag, .{ .LazyRuleElementNotTerminal = try allocator.dupe(u8, rule.name) });
+                    }
                     return error.LazyRuleElementNotTerminal;
                 }
             }
         }
     }
-    _ = allocator;
 }
 
 test "grammar optimizer end to end" {

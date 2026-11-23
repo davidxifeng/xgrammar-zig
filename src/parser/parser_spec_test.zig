@@ -583,15 +583,14 @@ test "regex macro json_string argument is honored" {
 test "earley parser fsm hook gate" {
     const EarleyParser = parser.EarleyParser;
     const installed = comptime parser.earley_parser.grammar_fsm_installed;
+    const grammar_mod = @import("../grammar/mod.zig");
     if (!installed) {
         // Constructing a parser over a grammar without fsm hooks reports the gate.
-        var builder = try parser.earley_parser.GrammarBuilder.new(testing.allocator);
+        var builder = try grammar_mod.GrammarBuilder.new(testing.allocator);
         defer builder.deinit();
         const bs = try builder.add_byte_string("a");
         _ = try builder.add_rule_named("root", bs);
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        const grammar = try builder.into_grammar_with_root_id(arena.allocator(), 0);
+        const grammar = try builder.into_grammar_with_root_id(testing.allocator, 0);
         defer grammar.deinit();
         grammar.set_optimized(true);
         if (EarleyParser.new(testing.allocator, grammar, null)) |p| {
@@ -603,8 +602,22 @@ test "earley parser fsm hook gate" {
         }
         return;
     }
-    // Hooks installed: run a real advance over an optimized grammar once the
-    // compiler wave can produce one; until then the FSM runtime paths are
-    // exercised by the fsm/compiler integration tests.
-    return error.SkipZigTest; // 解除: WaveGrammar 字段 + compiler.optimize 落地后编写端到端断言
+    // Hooks installed: run a real advance over an optimized grammar.
+    const functor_mod = @import("../functor/mod.zig");
+    var builder = try grammar_mod.GrammarBuilder.new(testing.allocator);
+    defer builder.deinit();
+    const bs = try builder.add_byte_string("a");
+    _ = try builder.add_rule_named("root", bs);
+    const grammar = try builder.into_grammar_with_root_id(testing.allocator, 0);
+    defer grammar.deinit();
+    const normalized = try functor_mod.grammar_normalizer(testing.allocator, grammar);
+    defer normalized.deinit();
+    const optimized = try functor_mod.grammar_optimizer(testing.allocator, normalized, null);
+    defer optimized.deinit();
+    const ep = try EarleyParser.new(testing.allocator, optimized, null);
+    defer ep.deinit();
+    try testing.expect(!ep.is_root_completed());
+    try testing.expect(try ep.advance('a'));
+    try testing.expect(ep.is_root_completed());
+    try testing.expect(!try ep.advance('b'));
 }

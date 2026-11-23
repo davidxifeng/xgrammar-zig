@@ -27,10 +27,20 @@ pub const FunctorErrorInfo = union(enum) {
     InvalidRepetitionRange: struct { lower: i64, upper: i64 },
     /// The build-failure message (allocated from the pass allocator; caller owns).
     FsmBuild: []const u8,
-    /// The name of the lazy rule.
+    /// The name of the lazy rule (allocated when produced by `grammar_optimizer`).
     LazyRuleBodyNotChoices: []const u8,
-    /// The name of the lazy rule.
+    /// The name of the lazy rule (allocated when produced by `grammar_optimizer`).
     LazyRuleElementNotTerminal: []const u8,
+
+    /// Releases any string allocated into `allocator` by a pass (no-op on `InvalidRepetitionRange`).
+    pub fn deinit(self: *FunctorErrorInfo, allocator: Allocator) void {
+        switch (self.*) {
+            .InvalidRepetitionRange => {},
+            .FsmBuild, .LazyRuleBodyNotChoices, .LazyRuleElementNotTerminal => |msg| {
+                allocator.free(msg);
+            },
+        }
+    }
 };
 
 /// Writes `info` into `diag` when present.
