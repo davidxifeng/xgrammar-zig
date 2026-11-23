@@ -1,7 +1,7 @@
 //! The attribute block of a rule definition, e.g. `name[max_tokens=10, capture] ::= ...`
 //! (`rule_attributes.rs`).
 
-const grammar = @import("grammar");
+const grammar = @import("../grammar/mod.zig");
 
 const SuffixStopInfo = grammar.SuffixStopInfo;
 

@@ -132,3 +132,37 @@
      `src/grammar/config.zig`(symlink→../config.zig,grammar 波代建的真实移植)
      使 `zig test src/grammar/mod.zig` 独立可跑;集成接线时删 symlink、改回
      `../support/mod.zig`、`../config.zig`。src/config.zig 本体归 Wave E。
+
+5. **parser 波次(WaveParser)**:
+   - 错误携带数据:`ParserError`/`LexerError` 保留为诊断 struct(Rust thiserror struct);
+     失败经 error set `error.Lexer`/`error.Parser` + 可选出参 `?*LexerError`/`?*ParserError`
+     回传,Display 文本经 `format_message` 逐字复现。`EbnfError` 变 error set
+     `{Lexer, Parser, Normalization}` + `EbnfErrorInfo`(union(enum)) 诊断出参;
+     `message_of` 复现 Rust `EbnfError::message`。
+   - `MacroArguments` 字段 `named` 与方法 `named` 重名:方法改名 `named_value`
+     (字段保留 Rust 名);`EarleyParser::is_completed()` 同因改 `is_root_completed`。
+   - 字符串所有权:token 的 lexeme/Str 值、RuleAttributes.capture_name、
+     stop_capture_name 由调用方 allocator 分配,`token.free_tokens` 统一释放;
+     ebnf_to_grammar_no_normalization 内部用临时 arena 承载 token/macro 值。
+   - `ebnf_to_grammar_no_normalization` 签名
+     `(gpa, ebnf_string, root_rule_name, diag) !(Allocator.Error || EbnfError)!*Grammar`;
+     into_grammar 缺 root 的错误消息逐字复现 `root rule "..." was never added`。
+   - `tokenize` 输入按 UTF-8 有效前提直拷(Rust `String::from_utf8_lossy` 在 `&str` 下不可达);
+     f64 温度前缀解析用 `std.fmt.parseFloat` 最长前缀(std::stod 语义)。
+   - `EarleyParser`:Rust `Arc<Grammar>` 改借用 `*const Grammar`;parser 堆分配自持
+     (`new` 返回 `!*EarleyParser`,`deinit` 释放)。`VecDeque` 用 `std.Deque`;
+     `enqueue` 在 Rust 无失败路径,`advance_byte_string` 处 OOM panic(`enqueue_no_fail`)。
+     `Clone` 未移植(matcher 波落地后如需再补)。
+   - **fsm 未接边**(全部 `error.NotImplementedInWaveFsm`,WaveFsm 落地后接线):
+     `EarleyParser.new` 内 `Grammar::fsm_state_offsets`/`root_initial_state`
+     (earley_parser.rs L156/L655)、`fsm_state_flags`/`initialize_fsm_state_flags`
+     (L671/L687)、`complete` 的 FSM-parent 分支(L427-446)、`completion_consumed_marker`
+     (L214)、`record_capture_event` 的 marker 分支(L262)、`enqueue_rule_start`
+     (L782)、`expand_next_rule_ref_element_on_fsm`(L820)、`enqueue_scan_target`
+     (L935)、`advance_fsm`(L953)、`scan_atomic_token`(L967);
+     `ebnf_parser.parse_regex_macro` 的 `flags` 分支(L419,需 `fsm::rewrite_regex_dots`)。
+     IR 路径(`rule_id == -1`)与非 fsm 数据结构完整可用。
+   - 开发期 symlink:src/parser/{support,grammar,config.zig} → ../;独立测试
+     `zig test src/parser/mod.zig` 75/75 绿(含 spec 测试 15 个 test 函数);
+     集成时删 symlink 并把 parser 内 `@import("support/mod.zig")` /
+     `@import("grammar/mod.zig")` 改回 `../support/mod.zig` / `../grammar/mod.zig`。

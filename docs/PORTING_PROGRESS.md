@@ -18,7 +18,7 @@
 ## Wave B(parser / fsm / functor)
 | Rust 文件 | Zig 文件 | 状态 |
 |---|---|---|
-| parser/* (earley_parser 1212、ebnf_parser 824、ebnf_lexer 681 等) | src/parser/* | ☐ |
+| parser/* (earley_parser 1212、ebnf_parser 824、ebnf_lexer 681 等) | src/parser/* (17 文件 + parser_spec_test.zig) | ✅(fsm 边登记 NotImplementedInWaveFsm) |
 | fsm/* (fsm_with_start_end 998、regex_ir 745、fsm 495 等) | src/fsm/* | ☐ |
 | functor/* (lazy_body_flattener 511、grammar_fsm_hasher 468 等) | src/functor/* | ☐ |
 
