@@ -119,10 +119,13 @@
    - `GrammarBuilder::edit_in_place` 闭包 → 两段式 `edit_in_place(grammar)` /
      `edit_in_place_commit(builder, grammar)`(借用 grammar 存储,追加直接落
      grammar arena)。
-   - fsm 波未落地:`Grammar` 的 `complete_fsm`/`per_rule_fsms` 字段与全部 fsm 依赖
-     路径(`complete_fsm`/`fsm_state_offsets`/`per_rule_fsm`/`set_fsms`/
-     `per_rule_fsms_slice`、序列化 fsm 分支、validate fsm 段)登记为
-     `error.NotImplementedInWaveFsm` 未接边,Wave B 落地后接线。
+   - fsm 挂点已接线(fsm 波落地后):`complete_fsm`/`per_rule_fsms` 字段就位,
+     `fsm_state_offsets`/`per_rule_fsm`/`set_fsms`/`per_rule_fsms_slice` 完整,
+     序列化 fsm 分支与 validate fsm 段齐备,`NotImplementedInWaveFsm` 已全部消除。
+     所有权:FSM 存储是 refcount(CompactFsmShared);`set_fsms` 对传入句柄
+     **retain**(非 Rust move——调用方保留自己的引用并自行 deinit),视图 clone 的
+     ends 缓冲一律用该视图自身 shared.allocator 分配/释放,避免跨分配器释放;
+     反序列化的 FSM 存储放在 grammar 自身 arena(随 grammar 释放,refcount 仍正确)。
    - 序列化键序:serde_json Map=BTreeMap → std.json ObjectMap 按字典序插入,
      `__VERSION__` 最先(陷阱 1);serialize_json_value* 增加
      `error.NotImplementedInWaveFsm`(仅 optimized 语法可达)。
@@ -153,15 +156,26 @@
      (`new` 返回 `!*EarleyParser`,`deinit` 释放)。`VecDeque` 用 `std.Deque`;
      `enqueue` 在 Rust 无失败路径,`advance_byte_string` 处 OOM panic(`enqueue_no_fail`)。
      `Clone` 未移植(matcher 波落地后如需再补)。
-   - **fsm 未接边**(全部 `error.NotImplementedInWaveFsm`,WaveFsm 落地后接线):
-     `EarleyParser.new` 内 `Grammar::fsm_state_offsets`/`root_initial_state`
-     (earley_parser.rs L156/L655)、`fsm_state_flags`/`initialize_fsm_state_flags`
-     (L671/L687)、`complete` 的 FSM-parent 分支(L427-446)、`completion_consumed_marker`
-     (L214)、`record_capture_event` 的 marker 分支(L262)、`enqueue_rule_start`
-     (L782)、`expand_next_rule_ref_element_on_fsm`(L820)、`enqueue_scan_target`
-     (L935)、`advance_fsm`(L953)、`scan_atomic_token`(L967);
-     `ebnf_parser.parse_regex_macro` 的 `flags` 分支(L419,需 `fsm::rewrite_regex_dots`)。
-     IR 路径(`rule_id == -1`)与非 fsm 数据结构完整可用。
+   - **fsm 接线(WaveFsm/WaveGrammar 落地后由 WaveParser 完成)**:earley_parser 全部
+     FSM 分支已按参照实现——`fsm_state_flags`/`initialize_fsm_state_flags`(状态标志
+     缓存)、`complete` 的 FSM-parent 分支、`completion_consumed_marker`、
+     `root_initial_state`、`enqueue_rule_start`、`expand_next_rule_ref_element_on_fsm`、
+     `enqueue_scan_target`、`advance_fsm`、`scan_atomic_token`;`fsm_state_offsets`
+     按 `Grammar::fsm_state_offsets`(grammar.rs L72)在 `init_fsm_state_offsets`
+     本地重算(complete_fsm 为 0 号存储,共享存储复用同一段)。
+     数据入口为 `Grammar.complete_fsm` / `Grammar.per_rule_fsms` 字段(WaveGrammar
+     挂点);字段安装前 comptime 门控 `grammar_fsm_installed` 把 FSM 路径拦为
+     `error.FsmNotInstalled`(临时门控,字段安装后自动消失;已置 SkipZigTest 的
+     端到端 Earley 测试随之解锁,注明在 parser_spec_test.zig)。缺 per-rule FSM
+     项按未安装处理(非 panic)。原 `error.NotImplementedInWaveFsm` 入口已全部消除。
+     `ebnf_parser.parse_regex_macro` 的 `flags` 分支已接 `fsm::rewrite_regex_dots`:
+     dot 语义按 dot_all 改写,case_insensitive 前缀 `(?i)`;'u' 为 no-op;未知 flag
+     报参照同文错误。flags 参数出现即触发 dot 改写(与参照一致)。
+   - 诊断消息从 `ebnf_to_grammar_no_normalization` 的临时 arena 提升(hoist)到
+     调用方 allocator,避免悬挂;错误消息归调用方 free。
+   - GrammarBuilder 在 grammar 波更新后 `update_rule_body_by_name`/
+     `update_lookahead_assertion_by_name`/`into_grammar` 错误集变化,parser 已适配
+     (`try` + `@errorCast` 收窄)。
    - 开发期 symlink:src/parser/{support,grammar,config.zig} → ../;独立测试
      `zig test src/parser/mod.zig` 75/75 绿(含 spec 测试 15 个 test 函数);
      集成时删 symlink 并把 parser 内 `@import("support/mod.zig")` /

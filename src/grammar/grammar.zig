@@ -17,6 +17,9 @@ const GrammarExprType = grammar_expr_type.GrammarExprType;
 const support = @import("../support/mod.zig");
 const Compact2dArray = support.Compact2dArray;
 const Compact2dArrayError = support.Compact2dArrayError;
+const fsm_mod = @import("../fsm/mod.zig");
+const CompactFsm = fsm_mod.CompactFsm;
+const CompactFsmWithStartEndWithSize = fsm_mod.CompactFsmWithStartEndWithSize;
 
 /// Per-rule original→normalized state id pair (Rust tuple `(i32, i32)`).
 pub const FsmStatePair = struct {
@@ -62,10 +65,11 @@ pub const Grammar = struct {
     suffix_stop_infos: std.ArrayList(SuffixStopInfo),
     exprs: Compact2dArray(i32),
     root_rule_id: i32,
-    // fsm wave installs `complete_fsm: CompactFsm` and
-    // `per_rule_fsms: ArrayList(?(fsm wave's CompactFsmWithStartEndWithSize))` here
-    // (reference grammar.rs lines 44–51); until then the fsm accessors/setters below
-    // are the registered unlinked edges.
+    /// The complete FSM produced by the grammar optimizer (empty until optimized).
+    /// FSM storage is refcounted on the grammar's backing allocator (not the arena).
+    complete_fsm: CompactFsm,
+    /// Per-rule compiled FSMs, usually sharing `complete_fsm` (empty until optimized).
+    per_rule_fsms: std.ArrayList(?CompactFsmWithStartEndWithSize),
     /// Per-rule FSM structural hashes (set by the FSM hasher; compile-time only).
     per_rule_fsm_hashes: std.ArrayList(?u64),
     /// Per-rule original→normalized state id pairs (set by the FSM hasher; compile-time only).
@@ -84,12 +88,16 @@ pub const Grammar = struct {
         const g = try arena.allocator().create(Grammar);
         var exprs = try Compact2dArray(i32).init(arena.allocator());
         errdefer exprs.deinit();
+        const complete_fsm = try CompactFsm.empty(backing);
+        errdefer complete_fsm.deinit();
         g.* = .{
             .arena = arena,
             .rules = .empty,
             .suffix_stop_infos = .empty,
             .exprs = exprs,
             .root_rule_id = NO_EXPR,
+            .complete_fsm = complete_fsm,
+            .per_rule_fsms = .empty,
             .per_rule_fsm_hashes = .empty,
             .per_rule_fsm_new_state_ids = .empty,
             .allow_empty_rule_ids = .empty,
@@ -98,8 +106,13 @@ pub const Grammar = struct {
         return g;
     }
 
-    /// Releases everything the grammar owns, including itself.
+    /// Releases everything the grammar owns, including itself. FSM storage is refcounted
+    /// on the backing allocator, so those handles are released explicitly first.
     pub fn deinit(self: *Grammar) void {
+        self.complete_fsm.deinit();
+        for (self.per_rule_fsms.items) |*maybe| {
+            if (maybe.*) |*view| view.deinit();
+        }
         const arena = self.arena;
         const backing = arena.child_allocator;
         arena.deinit();
@@ -134,6 +147,17 @@ pub const Grammar = struct {
         const out = try from_parts(backing, self.rules.items, &self.exprs, self.root_rule_id);
         errdefer out.deinit();
         const g = out.arena.allocator();
+        out.complete_fsm.deinit(); // retire the empty default; FSMs refcount on `backing`
+        out.complete_fsm = self.complete_fsm.clone();
+        try out.per_rule_fsms.ensureTotalCapacity(g, self.per_rule_fsms.items.len);
+        for (self.per_rule_fsms.items) |maybe| {
+            if (maybe) |view| {
+                const view_alloc = view.fsm.fsm.shared.allocator;
+                out.per_rule_fsms.appendAssumeCapacity(try view.clone(view_alloc));
+            } else {
+                out.per_rule_fsms.appendAssumeCapacity(null);
+            }
+        }
         try out.suffix_stop_infos.ensureTotalCapacity(g, self.suffix_stop_infos.items.len);
         for (self.suffix_stop_infos.items) |info|
             try out.suffix_stop_infos.append(g, try dupe_suffix_stop_info(g, info));
@@ -151,6 +175,20 @@ pub const Grammar = struct {
         if (a.root_rule_id != b.root_rule_id or a.optimized != b.optimized) return false;
         if (a.rules.items.len != b.rules.items.len) return false;
         for (a.rules.items, b.rules.items) |x, y| if (!x.eql(y)) return false;
+        if (!a.complete_fsm.eql(b.complete_fsm)) return false;
+        if (a.per_rule_fsms.items.len != b.per_rule_fsms.items.len) return false;
+        for (a.per_rule_fsms.items, b.per_rule_fsms.items) |x, y| {
+            const both_null = x == null and y == null;
+            if (!both_null and (x == null or y == null)) return false;
+            if (x == null) continue;
+            const vx = x.?;
+            const vy = y.?;
+            if (!vx.fsm.fsm.eql(vy.fsm.fsm)) return false;
+            if (vx.fsm.start != vy.fsm.start or vx.fsm.is_dfa != vy.fsm.is_dfa) return false;
+            if (vx.fsm.ends.items.len != vy.fsm.ends.items.len) return false;
+            for (vx.fsm.ends.items, vy.fsm.ends.items) |ex, ey| if (ex != ey) return false;
+            if (vx.edge_num != vy.edge_num or vx.node_num != vy.node_num) return false;
+        }
         if (a.suffix_stop_infos.items.len != b.suffix_stop_infos.items.len) return false;
         for (a.suffix_stop_infos.items, b.suffix_stop_infos.items) |x, y| if (!x.eql(y)) return false;
         if (!exprs_eql(&a.exprs, &b.exprs)) return false;
@@ -218,6 +256,89 @@ pub const Grammar = struct {
     /// Whether the grammar optimizer has run.
     pub fn is_optimized(self: *const Grammar) bool {
         return self.optimized;
+    }
+
+    /// The shared complete FSM (valid only after optimization) — Rust accessor
+    /// `complete_fsm()` (grammar.rs:66) dropped: the field owns the name; read
+    /// `.complete_fsm` directly.
+
+    /// State-cache offsets for distinct FSM storage. Shared rule views reuse one state
+    /// range (grammar.rs:72). The returned list is allocated from `allocator`.
+    pub fn fsm_state_offsets(
+        self: *const Grammar,
+        allocator: Allocator,
+    ) Allocator.Error!std.ArrayList(usize) {
+        const Storage = struct { fsm: CompactFsm, offset: usize };
+        var storage: std.ArrayList(Storage) = .empty;
+        // The table only copies refcounted handles; releasing the buffer is always safe.
+        defer storage.deinit(allocator);
+        try storage.append(allocator, .{ .fsm = self.complete_fsm, .offset = 0 });
+        var next_offset: usize = @intCast(self.complete_fsm.num_states());
+        var offsets: std.ArrayList(usize) = .empty;
+        errdefer offsets.deinit(allocator);
+        for (self.per_rule_fsms.items) |maybe| {
+            const view = maybe orelse {
+                try offsets.append(allocator, 0);
+                continue;
+            };
+            const fsm = view.get_fsm().get_fsm();
+            var offset: ?usize = null;
+            for (storage.items) |entry| {
+                if (fsm.shares_storage(entry.fsm)) {
+                    offset = entry.offset;
+                    break;
+                }
+            }
+            if (offset == null) {
+                offset = next_offset;
+                next_offset += @intCast(fsm.num_states());
+                try storage.append(allocator, .{ .fsm = fsm, .offset = offset.? });
+            }
+            try offsets.append(allocator, offset.?);
+        }
+        return offsets;
+    }
+
+    /// The compiled FSM for `rule_id`, if built (grammar.rs:96).
+    pub fn per_rule_fsm(self: *const Grammar, rule_id: i32) ?*const CompactFsmWithStartEndWithSize {
+        const idx: usize = @intCast(rule_id);
+        if (idx >= self.per_rule_fsms.items.len) return null;
+        return if (self.per_rule_fsms.items[idx]) |*view| view else null;
+    }
+
+    /// Installs the compiled FSMs (used by the grammar FSM builder; grammar.rs:144).
+    /// The grammar retains its own references to the passed handles (Rust moves the
+    /// values; this port keeps the caller's handles valid — deinit them yourself).
+    pub fn set_fsms(
+        self: *Grammar,
+        complete_fsm: CompactFsm,
+        per_rule_fsms: []const ?CompactFsmWithStartEndWithSize,
+    ) Allocator.Error!void {
+        const g = self.arena.allocator();
+        self.per_rule_fsms.clearRetainingCapacity();
+        errdefer {
+            for (self.per_rule_fsms.items) |*maybe| {
+                if (maybe.*) |*view| view.deinit();
+            }
+            self.per_rule_fsms.clearRetainingCapacity();
+        }
+        for (per_rule_fsms) |maybe| {
+            if (maybe) |view| {
+                // Clone on the view's own allocator so the ends buffer is released by
+                // the same allocator that frees the shared storage.
+                const view_alloc = view.fsm.fsm.shared.allocator;
+                try self.per_rule_fsms.append(g, try view.clone(view_alloc));
+            } else {
+                try self.per_rule_fsms.append(g, null);
+            }
+        }
+        self.complete_fsm.deinit();
+        self.complete_fsm = complete_fsm.clone();
+    }
+
+    /// Per-rule compiled FSM slices (empty until optimized; grammar.rs:170).
+    pub fn per_rule_fsms_slice(self: *const Grammar) []const ?CompactFsmWithStartEndWithSize {
+        return self.per_rule_fsms.items;
     }
 
     /// Sets the empty-rule ids (used by the allow-empty analyzer).
@@ -391,4 +512,72 @@ test "grammar from parts, clone and accessors" {
     try std.testing.expectEqual(@as(i32, 3), grammar.fsm_new_state_ids(0)[0].original);
     try std.testing.expectEqual(@as(usize, 0), grammar.fsm_new_state_ids(1).len);
     try std.testing.expectEqual(@as(usize, 0), grammar.fsm_new_state_ids(9).len);
+}
+
+test "fsm members: set_fsms, offsets, clone and shared storage" {
+    const backing = std.testing.allocator;
+    const Fsm = fsm_mod.Fsm;
+    const CompactFsmWithStartEnd = fsm_mod.CompactFsmWithStartEnd;
+
+    // complete FSM: 0 -a-> 1 -b-> 2, 0 -e-> 2
+    var fsm = try Fsm.new(backing, 3);
+    defer fsm.deinit();
+    try fsm.add_edge(0, 1, 'a', 'a');
+    try fsm.add_edge(1, 2, 'b', 'b');
+    try fsm.add_epsilon_edge(0, 2);
+    var complete = try CompactFsm.from_fsm(backing, &fsm);
+    defer complete.deinit();
+
+    // distinct FSM for rule 1
+    var fsm2 = try Fsm.new(backing, 2);
+    defer fsm2.deinit();
+    try fsm2.add_edge(0, 1, 'c', 'c');
+    var distinct = try CompactFsm.from_fsm(backing, &fsm2);
+    defer distinct.deinit();
+
+    var builder_arena = ArenaAllocator.init(backing);
+    defer builder_arena.deinit();
+    var builder = try @import("grammar_builder.zig").GrammarBuilder.new(backing);
+    defer builder.deinit();
+    _ = try builder.add_rule_named("r0", try builder.add_empty_str());
+    _ = try builder.add_rule_named("r1", try builder.add_empty_str());
+    const grammar = try builder.into_grammar_with_root_id(backing, 0);
+    defer grammar.deinit();
+
+    // rule 0 shares the complete FSM's storage; rule 1 stays distinct
+    var ends0: std.ArrayList(i32) = .empty;
+    try ends0.append(backing, 2);
+    const view0 = try CompactFsmWithStartEnd.new(backing, complete.clone(), 0, ends0, false);
+    var ends1: std.ArrayList(i32) = .empty;
+    try ends1.append(backing, 1);
+    const view1 = try CompactFsmWithStartEnd.new(backing, distinct.clone(), 0, ends1, false);
+    // The sized wrappers move the views: only `sized0`/`sized1` release them
+    // (Zig cannot enforce moves — do not deinit the moved copies).
+    var sized0 = CompactFsmWithStartEndWithSize.new(view0, 3, 3);
+    defer sized0.deinit();
+    var sized1 = CompactFsmWithStartEndWithSize.new(view1, 1, 2);
+    defer sized1.deinit();
+
+    try grammar.set_fsms(complete, &.{ sized0, sized1 });
+    grammar.set_optimized(true);
+    try std.testing.expect(grammar.complete_fsm.eql(complete));
+    try std.testing.expect(grammar.per_rule_fsm(0) != null);
+    try std.testing.expect(grammar.per_rule_fsm(7) == null);
+    try std.testing.expect(grammar.per_rule_fsm(0).?.get_fsm().get_fsm().shares_storage(complete));
+    try std.testing.expect(!grammar.per_rule_fsm(1).?.get_fsm().get_fsm().shares_storage(complete));
+
+    var offsets = try grammar.fsm_state_offsets(backing);
+    defer offsets.deinit(backing);
+    try std.testing.expectEqual(@as(usize, 2), offsets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), offsets.items[0]); // shares complete storage
+    try std.testing.expectEqual(@as(usize, 3), offsets.items[1]); // distinct storage after 3 states
+
+    try std.testing.expectEqual(@as(usize, 2), grammar.per_rule_fsms_slice().len);
+
+    const cloned = try grammar.clone(backing);
+    defer cloned.deinit();
+    try std.testing.expect(grammar.eql(cloned));
+    try std.testing.expect(cloned.complete_fsm.shares_storage(grammar.complete_fsm));
+    grammar.per_rule_fsms.items[0].?.fsm.start = 1;
+    try std.testing.expect(!grammar.eql(cloned));
 }

@@ -9,12 +9,12 @@
 //! The matcher and the token-mask cache builder extend the parser (they derive from it in
 //! the C++), so the fields they drive directly are public.
 //!
-//! fsm 波未落地：所有触达 per-rule FSM / complete-FSM 的路径
-//! （`fsm_state_flags`/`initialize_fsm_state_flags`/`root_initial_state`/`enqueue_rule_start`/
-//! `expand_next_rule_ref_element_on_fsm`/`advance_fsm`/`scan_atomic_token`/
-//! `completion_consumed_marker`/`record_capture_event` 的 marker 分支/
-//! `complete` 的 FSM-parent 分支）登记为 `error.NotImplementedInWaveFsm`，
-//! 参照行号见各函数注释；fsm 落地后以 `Grammar.per_rule_fsm`/`complete_fsm` 接线。
+//! FSM 数据经 `Grammar.complete_fsm` / `Grammar.per_rule_fsms` 字段接入
+//! （WaveGrammar 的挂点，见 grammar.zig 注释；Rust `Grammar::fsm_state_offsets` 在此
+//! 本地重算，参照 grammar.rs L72）。字段安装前由 comptime 门控
+//! `grammar_fsm_installed` 拦下：入口一律 `error.FsmNotInstalled`（解除条件：字段
+//! 安装后自动消失，非长期接口）；缺 per-rule FSM 视为逻辑不变量，按 Rust
+//! `expect("per-rule FSM")` panic。
 
 const std = @import("std");
 
@@ -25,6 +25,7 @@ const parser_state_mod = @import("parser_state.zig");
 const repeat_detector_mod = @import("repeat_detector.zig");
 const grammar_mod = @import("../grammar/mod.zig");
 const support = @import("../support/mod.zig");
+const fsm_mod = @import("../fsm/mod.zig");
 
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
@@ -45,8 +46,16 @@ const FSM_STATE_NON_TERMINAL: u8 = 1 << 2;
 const FSM_STATE_END: u8 = 1 << 3;
 const FSM_STATE_HAS_EDGES: u8 = 1 << 4;
 
-/// Errors raised by the parser (OOM plus the fsm-wave unlinked edges).
-pub const EarleyError = Allocator.Error || Compact2dArrayError || error{NotImplementedInWaveFsm};
+/// Errors raised by the parser (OOM plus the temporary fsm-hook gate).
+pub const EarleyError = Allocator.Error || Compact2dArrayError || FsmGateError;
+
+/// WaveGrammar 尚未在 `Grammar` 上安装 `complete_fsm`/`per_rule_fsms` 字段时
+/// FSM 路径的门控错误（comptime 检测，字段安装后自动不可达）。
+pub const FsmGateError = error{FsmNotInstalled};
+
+/// Whether `Grammar` already carries the fsm-wave hooks (set by WaveGrammar).
+pub const grammar_fsm_installed =
+    @hasField(Grammar, "complete_fsm") and @hasField(Grammar, "per_rule_fsms");
 
 /// An incremental Earley parser over an optimized grammar's per-rule FSMs.
 pub const EarleyParser = struct {
@@ -115,8 +124,8 @@ pub const EarleyParser = struct {
     ///
     /// The returned parser is heap-allocated and owns itself (`deinit`).
     /// Rust panics on an unoptimized grammar; this port asserts it.
-    /// fsm 未落地时 `push_state_and_expand` 抛 `error.NotImplementedInWaveFsm`
-    /// （fsm_state_offsets 取自 `Grammar::fsm_state_offsets`，参照 earley_parser.rs `new`）。
+    /// `Grammar` 的 fsm 挂点（WaveGrammar）安装前抛 `error.FsmNotInstalled`
+    /// （`fsm_state_offsets` 按 `Grammar::fsm_state_offsets`，参照 earley_parser.rs `new`）。
     pub fn new(
         gpa: Allocator,
         grammar: *const Grammar,
@@ -189,6 +198,7 @@ pub const EarleyParser = struct {
             .tmp_completed_lazy_occurrences = .empty,
         };
         errdefer parser.deinit();
+        try parser.init_fsm_state_offsets();
         const initial = initial_state orelse try parser.root_initial_state();
         try parser.push_state_and_expand(initial);
         return parser;
@@ -238,12 +248,58 @@ pub const EarleyParser = struct {
     /// Whether completing the occurrence of a suffix/stop rule actually consumed its trailing
     /// marker. A non-looping tag dispatch can also complete before its trigger is seen; only the
     /// terminal post-dispatch state has no outgoing edges.
-    ///
-    /// fsm 未落地（`Grammar::per_rule_fsm`，参照 earley_parser.rs `completion_consumed_marker`）。
     fn completion_consumed_marker(self: *const EarleyParser, state: ParserState) EarleyError!bool {
-        _ = self;
-        _ = state;
-        return error.NotImplementedInWaveFsm;
+        const body = self.grammar.expr(self.grammar.rule(state.rule_id).body_expr_id);
+        if (body.ty != .TagDispatch) return true;
+        const fsm = try self.per_rule_fsm(state.rule_id);
+        return fsm.get_fsm().state_edges(state.element_id).len == 0;
+    }
+
+    /// The shared complete FSM (Rust `Grammar::complete_fsm()`).
+    fn complete_fsm(self: *const EarleyParser) FsmGateError!fsm_mod.CompactFsm {
+        if (comptime !grammar_fsm_installed) return error.FsmNotInstalled;
+        return self.grammar.complete_fsm;
+    }
+
+    /// The compiled per-rule FSM view (Rust `Grammar::per_rule_fsm(...).expect("per-rule FSM")`
+    /// unwrapped to the `CompactFsmWithStartEnd`). A missing entry is the temporary
+    /// not-installed gate until WaveGrammar populates the field.
+    fn per_rule_fsm(
+        self: *const EarleyParser,
+        rule_id: i32,
+    ) FsmGateError!*const fsm_mod.CompactFsmWithStartEnd {
+        if (comptime !grammar_fsm_installed) return error.FsmNotInstalled;
+        const idx: usize = @intCast(rule_id);
+        if (idx >= self.grammar.per_rule_fsms.items.len) return error.FsmNotInstalled;
+        const view = self.grammar.per_rule_fsms.items[idx] orelse return error.FsmNotInstalled;
+        return &view.fsm;
+    }
+
+    /// Computes `Grammar::fsm_state_offsets` (grammar.rs L72) into `self.fsm_state_offsets`:
+    /// distinct FSM storages get consecutive state ranges; shared rule views reuse one range.
+    fn init_fsm_state_offsets(self: *EarleyParser) (FsmGateError || Allocator.Error)!void {
+        if (comptime !grammar_fsm_installed) return error.FsmNotInstalled;
+        self.fsm_state_offsets.clearRetainingCapacity();
+        var storage: ArrayList(fsm_mod.CompactFsm) = .empty;
+        defer storage.deinit(self.gpa);
+        const shared_complete = self.grammar.complete_fsm;
+        try storage.append(self.gpa, shared_complete);
+        var next_offset = @as(usize, @intCast(complete.num_states()));
+        try self.fsm_state_offsets.append(self.gpa, 0);
+        for (self.grammar.per_rule_fsms.items) |view| {
+            const offset = blk: {
+                const wrapper = view orelse break :blk 0;
+                const fsm = wrapper.fsm.get_fsm();
+                for (storage.items, 0..) |shared, i| {
+                    if (fsm.shares_storage(shared)) break :blk self.fsm_state_offsets.items[i];
+                }
+                const offset = next_offset;
+                next_offset += @as(usize, @intCast(fsm.num_states()));
+                storage.append(self.gpa, fsm) catch unreachable;
+                break :blk offset;
+            };
+            try self.fsm_state_offsets.append(self.gpa, offset);
+        }
     }
 
     /// Collects the captured rule occurrences whose concrete Earley parent chains contain the
@@ -441,9 +497,27 @@ pub const EarleyParser = struct {
             }
             // The rule is referenced by a FSM: check whether the parent sits on a repeat edge (by
             // invariance, a state with a repeat edge has exactly one outgoing edge).
-            // fsm 未落地（`Grammar::per_rule_fsm`/`complete_fsm().repeat_edge_info`，
-            // 参照 earley_parser.rs `complete` FSM-parent 分支）。
-            return error.NotImplementedInWaveFsm;
+            const fsm = try self.complete_fsm();
+            var repeat: ?struct { target: i32, lower: i32, upper: i32 } = null;
+            for (fsm.state_edges(parent_state.element_id)) |edge| {
+                if (!edge.is_repeat_ref()) continue;
+                const info = fsm.repeat_edge_info(edge.aux_index());
+                if (info.rule_id() == ref_id) {
+                    repeat = .{ .target = edge.target, .lower = info.lower(), .upper = info.upper() };
+                    break;
+                }
+            }
+            const found = repeat orelse {
+                try self.enqueue(parent_state);
+                continue;
+            };
+            const new_count = parent_state.repeat_count + 1;
+            if (new_count >= found.lower) {
+                try self.enqueue(parent_state.at_element(found.target));
+            }
+            if (new_count < found.upper) {
+                try self.enqueue(parent_state.at_element_with_repeat(parent_state.element_id, new_count));
+            }
         }
     }
 
@@ -598,30 +672,56 @@ pub const EarleyParser = struct {
         self.tmp_states_to_be_added.shrinkRetainingCapacity(write);
     }
 
-    /// fsm 未落地（`Grammar::per_rule_fsm` 状态标志缓存，参照 earley_parser.rs
-    /// `fsm_state_flags`）。
     fn fsm_state_flags(self: *EarleyParser, rule_id: i32, state_id: i32) EarleyError!u8 {
-        _ = self;
-        _ = rule_id;
-        _ = state_id;
-        return error.NotImplementedInWaveFsm;
+        const index = self.fsm_state_offsets.items[@intCast(rule_id)] + @as(usize, @intCast(state_id));
+        if (index < self.fsm_state_flags_cache.items.len) {
+            const entry = self.fsm_state_flags_cache.items[index];
+            if (entry & 0xFF != 0 and entry >> 8 == @as(u64, @intCast(rule_id))) {
+                return @truncate(entry);
+            }
+        }
+        return self.initialize_fsm_state_flags(rule_id, state_id);
     }
 
-    /// fsm 未落地（参照 earley_parser.rs `initialize_fsm_state_flags`，#[cold] 路径）。
     fn initialize_fsm_state_flags(self: *EarleyParser, rule_id: i32, state_id: i32) EarleyError!u8 {
-        _ = self;
-        _ = rule_id;
-        _ = state_id;
-        return error.NotImplementedInWaveFsm;
+        const fsm = try self.per_rule_fsm(rule_id);
+        const offset = self.fsm_state_offsets.items[@intCast(rule_id)];
+        if (self.fsm_state_flags_cache.items.len < offset + @as(usize, @intCast(fsm.num_states()))) {
+            try self.fsm_state_flags_cache.appendNTimes(self.gpa, 0, offset + @as(usize, @intCast(fsm.num_states())) - self.fsm_state_flags_cache.items.len);
+        }
+        var flags = FSM_STATE_INITIALIZED;
+        if (fsm.is_end_state(state_id)) {
+            flags |= FSM_STATE_END;
+        }
+        const edges = fsm.get_fsm().state_edges(state_id);
+        if (edges.len != 0) {
+            flags |= FSM_STATE_HAS_EDGES;
+        }
+        for (edges) |edge| {
+            if (edge.is_char_range() or edge.is_token() or edge.is_exclude_token()) {
+                flags |= FSM_STATE_SCANABLE;
+            } else if (edge.is_rule_ref() or edge.is_epsilon() or edge.is_repeat_ref()) {
+                flags |= FSM_STATE_NON_TERMINAL;
+            }
+        }
+        self.fsm_state_flags_cache.items[offset + @as(usize, @intCast(state_id))] =
+            @as(u64, @intCast(rule_id)) << 8 | flags;
+        return flags;
     }
 
     /// The initial state expanded from the root rule of the grammar.
-    ///
-    /// fsm 未落地（`Grammar::per_rule_fsm(root).fsm().start()`，参照 earley_parser.rs
-    /// `root_initial_state`）。
     pub fn root_initial_state(self: *const EarleyParser) EarleyError!ParserState {
-        _ = self;
-        return error.NotImplementedInWaveFsm;
+        const root_rule_id = self.grammar.root_rule_id;
+        var state = ParserState.new(
+            root_rule_id,
+            self.grammar.root_rule().body_expr_id,
+            (try self.per_rule_fsm(root_rule_id)).get_start(),
+            ParserState.NO_PREV_INPUT_POS,
+        );
+        state.budget_deadline = self.deadline_for_rule(root_rule_id, -1);
+        state.active_temperature_rule_id = self.resolve_active_temperature_rule(root_rule_id, -1);
+        state.char_budget_deadline = self.char_deadline_for_rule(root_rule_id, -1);
+        return state;
     }
 
     /// Pushes `state` and expands it through the predict/complete loop into a new position.
@@ -712,25 +812,31 @@ pub const EarleyParser = struct {
     }
 
     /// Enqueues the start state of a newly predicted occurrence of `ref_rule_id`.
-    ///
-    /// fsm 未落地（`Grammar::per_rule_fsm(ref_rule).fsm().start()`，参照 earley_parser.rs
-    /// `enqueue_rule_start`）。
     fn enqueue_rule_start(
         self: *EarleyParser,
         state: ParserState,
         ref_rule_id: i32,
         right_recursion_to_root: bool,
     ) EarleyError!void {
-        if (self.grammar.rule(ref_rule_id).max_chars >= 0) {
+        const ref_rule = self.grammar.rule(ref_rule_id);
+        if (ref_rule.max_chars >= 0) {
             self.tmp_char_budget_entered = true;
         }
         const start_pos: i32 = if (right_recursion_to_root)
             ParserState.NO_PREV_INPUT_POS
         else
             @as(i32, @intCast(self.rule_id_to_completable_states.len())) - 1;
-        _ = start_pos;
-        _ = state;
-        return error.NotImplementedInWaveFsm;
+        var new_state = ParserState.new(
+            ref_rule_id,
+            ref_rule.body_expr_id,
+            (try self.per_rule_fsm(ref_rule_id)).get_start(),
+            start_pos,
+        );
+        new_state.budget_deadline = self.deadline_for_rule(ref_rule_id, state.budget_deadline);
+        new_state.active_temperature_rule_id =
+            self.resolve_active_temperature_rule(ref_rule_id, state.active_temperature_rule_id);
+        new_state.char_budget_deadline = self.char_deadline_for_rule(ref_rule_id, state.char_budget_deadline);
+        try self.enqueue(new_state);
     }
 
     /// Predicts a rule reference or repeat element in an IR sequence (lookahead path).
@@ -754,13 +860,51 @@ pub const EarleyParser = struct {
     }
 
     /// Predicts the rule references, repeat references, and epsilon edges of a FSM state.
-    ///
-    /// fsm 未落地（`Grammar::per_rule_fsm` edges 与 `complete_fsm().repeat_edge_info`，参照
-    /// earley_parser.rs `expand_next_rule_ref_element_on_fsm`）。
     fn expand_next_rule_ref_element_on_fsm(self: *EarleyParser, state: ParserState) EarleyError!void {
-        _ = self;
-        _ = state;
-        return error.NotImplementedInWaveFsm;
+        // Rust snapshots the edges into a SmallVec before enqueuing; the grammar's edge table
+        // is immutable during the loop, so the borrowed slice is equivalent.
+        const fsm = try self.per_rule_fsm(state.rule_id);
+        const edges = fsm.get_fsm().state_edges(state.element_id);
+        for (edges) |edge| {
+            if (edge.is_epsilon()) {
+                try self.enqueue(state.at_element(edge.target));
+                continue;
+            }
+            const target = edge.target;
+            var ref_rule_id: i32 = undefined;
+            var is_repeat = false;
+            if (edge.is_rule_ref()) {
+                ref_rule_id = edge.ref_rule_id();
+            } else if (edge.is_repeat_ref()) {
+                const info = (try self.complete_fsm()).repeat_edge_info(edge.aux_index());
+                if (state.repeat_count >= info.lower()) {
+                    try self.enqueue(state.at_element(target));
+                }
+                if (state.repeat_count >= info.upper()) {
+                    continue;
+                }
+                ref_rule_id = info.rule_id();
+                is_repeat = true;
+            } else {
+                continue;
+            }
+
+            const target_flags = try self.fsm_state_flags(state.rule_id, target);
+            const is_right_recursion =
+                !is_repeat and target_flags & FSM_STATE_HAS_EDGES == 0 and target_flags & FSM_STATE_END != 0;
+            // For repeat edges the parent entry keeps the source state and the repeat count; for
+            // rule references it is the post-transition state.
+            const parent_entry = if (is_repeat)
+                state.at_element_with_repeat(state.element_id, state.repeat_count)
+            else
+                state.at_element(target);
+            const right_recursion_to_root =
+                try self.add_completable_parents(state, ref_rule_id, is_right_recursion, parent_entry);
+            if (!is_repeat and self.rule_is_nullable[@intCast(ref_rule_id)]) {
+                try self.enqueue(state.at_element(target));
+            }
+            try self.enqueue_rule_start(state, ref_rule_id, right_recursion_to_root);
+        }
     }
 
     fn advance_byte_string(self: *EarleyParser, state: ParserState, ch: u8, expr_id: i32) void {
@@ -868,28 +1012,54 @@ pub const EarleyParser = struct {
     }
 
     /// Enqueues a post-scan state: scanable leaves skip the predict/complete queue.
-    ///
-    /// fsm 未落地（参照 earley_parser.rs `enqueue_scan_target`）。
     fn enqueue_scan_target(self: *EarleyParser, new_state: ParserState) EarleyError!void {
-        _ = self;
-        _ = new_state;
-        return error.NotImplementedInWaveFsm;
+        const flags = try self.fsm_state_flags(new_state.rule_id, new_state.element_id);
+        if (flags & FSM_STATE_NON_TERMINAL == 0 and flags & FSM_STATE_END == 0 and flags & FSM_STATE_SCANABLE != 0) {
+            try self.enqueue_without_processing(new_state);
+        } else {
+            try self.enqueue(new_state);
+        }
     }
 
-    /// fsm 未落地（参照 earley_parser.rs `advance_fsm`）。
     fn advance_fsm(self: *EarleyParser, state: ParserState, ch: u8) EarleyError!void {
-        _ = self;
-        _ = state;
-        _ = ch;
-        return error.NotImplementedInWaveFsm;
+        const value: i32 = ch;
+        // Rust collects the matching targets into a SmallVec before enqueuing; the grammar's
+        // edge table is immutable during the loop, so the two passes are equivalent.
+        const fsm = try self.per_rule_fsm(state.rule_id);
+        const edges = fsm.get_fsm().state_edges(state.element_id);
+        var targets: ArrayList(i32) = .empty;
+        defer targets.deinit(self.gpa);
+        for (edges) |edge| {
+            if (edge.is_char_range() and edge.min <= value and value <= edge.max) {
+                try targets.append(self.gpa, edge.target);
+            }
+        }
+        for (targets.items) |element_id| {
+            try self.enqueue_scan_target(state.with_element(element_id));
+        }
     }
 
-    /// fsm 未落地（参照 earley_parser.rs `scan_atomic_token`）。
     fn scan_atomic_token(self: *EarleyParser, state: ParserState, token_id: i32) EarleyError!void {
-        _ = self;
-        _ = state;
-        _ = token_id;
-        return error.NotImplementedInWaveFsm;
+        if (state.rule_id == -1) return;
+        const fsm = try self.per_rule_fsm(state.rule_id);
+        const edges = fsm.get_fsm().state_edges(state.element_id);
+        var targets: ArrayList(i32) = .empty;
+        defer targets.deinit(self.gpa);
+        for (edges) |edge| {
+            const matches = blk: {
+                if (edge.is_token()) {
+                    break :blk fsm.get_fsm().token_edge_info(edge.aux_index()).contains(token_id);
+                } else if (edge.is_exclude_token()) {
+                    break :blk fsm.get_fsm().exclude_token_edge_info(edge.aux_index()).accepts(token_id);
+                } else {
+                    break :blk false;
+                }
+            };
+            if (matches) try targets.append(self.gpa, edge.target);
+        }
+        for (targets.items) |element_id| {
+            try self.enqueue_scan_target(state.with_element(element_id));
+        }
     }
 
     /// Advances the parser by accepting a whole token via token/exclude-token edges, consuming

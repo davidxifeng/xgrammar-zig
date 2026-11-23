@@ -78,6 +78,13 @@ pub const ParserState = struct {
         return out;
     }
 
+    /// The struct-update `{ element_id, ..*self }`: only the FSM node changes.
+    pub fn with_element(self: ParserState, element_id: i32) ParserState {
+        var out = self;
+        out.element_id = element_id;
+        return out;
+    }
+
     /// The adaptive token-mask cache key of this state.
     pub fn cache_key(self: ParserState) ParserStateCacheKey {
         return .{

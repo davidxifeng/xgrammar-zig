@@ -5,8 +5,9 @@
 //!
 //! The parser keeps its token strings and macro values in a per-call arena (Rust frees via
 //! `Drop`); the built `Grammar` is allocated with the caller's backing allocator and owns
-//! itself. The `flags` branch of `Regex(...)` needs the fsm wave's `rewrite_regex_dots`
-//! and surfaces `error.NotImplementedInWaveFsm` until it lands.
+//! itself. The `flags` branch of `Regex(...)` rewrites dots via `fsm::rewrite_regex_dots`
+//! and prefixes `(?i)` for case-insensitivity (dot rewriting applies whenever `flags` is
+//! present, matching the reference).
 
 const std = @import("std");
 
@@ -19,6 +20,8 @@ const rule_attributes = @import("rule_attributes.zig");
 const token_mod = @import("token.zig");
 const token_type = @import("token_type.zig");
 const grammar = @import("../grammar/mod.zig");
+const support = @import("../support/mod.zig");
+const fsm_mod = @import("../fsm/mod.zig");
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -50,21 +53,53 @@ pub fn ebnf_to_grammar_no_normalization(
     ebnf_string: []const u8,
     root_rule_name: []const u8,
     diag: ?*EbnfErrorInfo,
-) (Allocator.Error || EbnfError)!*Grammar {
+) (Allocator.Error || support.compact_2d_array.Compact2dArrayError || EbnfError)!*Grammar {
     var arena = ArenaAllocator.init(gpa);
     defer arena.deinit();
     const arena_gpa = arena.allocator();
 
     var lexer_diag = lexer_error.LexerError{};
     const tokens = ebnf_lexer.tokenize(arena_gpa, ebnf_string, &lexer_diag) catch |e| switch (e) {
-        error.Lexer => return ebnf_error.report(diag, .{ .lexer = lexer_diag }),
+        error.Lexer => {
+            var info: EbnfErrorInfo = .{ .lexer = lexer_diag };
+            hoist_lexer_diag(gpa, &info.lexer);
+            return ebnf_error.report(diag, info);
+        },
         error.OutOfMemory => return error.OutOfMemory,
     };
 
     var builder = try GrammarBuilder.new(gpa);
     errdefer builder.deinit();
     var parser = Parser.new(arena_gpa, gpa, builder, tokens, root_rule_name, diag);
-    return parser.parse();
+    return parser.parse() catch |e| switch (e) {
+        error.Parser => {
+            // The parser wrote its diagnostic from the temporary arena; copy the
+            // message into the caller's allocator before the arena disappears.
+            if (diag) |d| {
+                switch (d.*) {
+                    .parser => |*p| {
+                        const copy = blk: {
+                            if (p.message.len > 0) break :blk gpa.dupe(u8, p.message) catch "";
+                            break :blk "";
+                        };
+                        p.message = copy;
+                    },
+                    else => {},
+                }
+            }
+            return error.Parser;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => @errorCast(e),
+    };
+}
+
+/// Copies a lexer diagnostic message out of the temporary arena into `gpa`.
+fn hoist_lexer_diag(gpa: Allocator, e: *lexer_error.LexerError) void {
+    if (e.message.len > 0) {
+        const copy = gpa.dupe(u8, e.message) catch "";
+        e.message = copy;
+    }
 }
 
 const Parser = struct {
@@ -433,26 +468,32 @@ const Parser = struct {
                 .Str => |s| s,
                 else => return self.fail_at(delta, "flags must be a string"),
             };
+            var case_insensitive = false;
+            var dot_all = false;
             var indices = std.unicode.Utf8View.initUnchecked(flags).iterator();
             while (indices.nextCodepoint()) |flag| {
                 switch (flag) {
+                    'i' => case_insensitive = true,
+                    's' => dot_all = true,
                     // XGrammar regular expressions use Unicode codepoint semantics by default.
                     'u' => {},
-                    else => {
-                        // 'i' / 's' need fsm::rewrite_regex_dots（fsm 波未落地）。
-                        return self.fail_at_print(
-                            delta,
-                            "regular-expression flag '{u}' is not supported",
-                            .{flag},
-                        );
-                    },
+                    else => return self.fail_at_print(
+                        delta,
+                        "regular-expression flag '{u}' is not supported",
+                        .{flag},
+                    ),
                 }
             }
             // The flags argument opts into the standard dot semantics: '.' does not match '\n'
-            // unless the 's' flag is given; case-insensitivity prefixes `(?i)`. Both need
-            // fsm::rewrite_regex_dots（fsm 波未落地，参照 ebnf_parser.rs parse_regex_macro 与
-            // fsm/rewrite_regex_dots.rs）。
-            return error.NotImplementedInWaveFsm;
+            // unless the 's' flag is given. Without the argument the pattern is stored verbatim,
+            // where the engine's '.' matches every codepoint.
+            var rewritten = try fsm_mod.rewrite_regex_dots(self.gpa, pattern, dot_all);
+            if (case_insensitive and !std.mem.startsWith(u8, rewritten, "(?i)")) {
+                const prefixed = try std.mem.concat(self.gpa, u8, &.{ "(?i)", rewritten });
+                self.gpa.free(rewritten);
+                rewritten = prefixed;
+            }
+            return self.builder.add_regex(rewritten, json_string);
         }
         return self.builder.add_regex(pattern, json_string);
     }
@@ -871,12 +912,12 @@ const Parser = struct {
         }
     }
 
-    fn parse(self: *Parser) (Allocator.Error || EbnfError)!*Grammar {
+    fn parse(self: *Parser) (Allocator.Error || support.compact_2d_array.Compact2dArrayError || EbnfError)!*Grammar {
         try self.init_rule_names();
         while (self.cur().ty != .EndOfFile) {
             const parsed = try self.parse_rule();
-            self.builder.update_rule_body_by_name(parsed.name, parsed.body_expr_id);
-            self.builder.update_lookahead_assertion_by_name(parsed.name, parsed.lookahead_assertion_id);
+            try self.builder.update_rule_body_by_name(parsed.name, parsed.body_expr_id);
+            try self.builder.update_lookahead_assertion_by_name(parsed.name, parsed.lookahead_assertion_id);
             if (parsed.attributes) |attributes| {
                 const rule_id = try self.builder.get_rule_id(parsed.name);
                 const info = attributes.suffix_stop_info;
@@ -910,7 +951,10 @@ const Parser = struct {
                 } };
                 return error.Parser;
             },
-            else => return e,
+            else => {
+                self.builder.deinit();
+                return @errorCast(e);
+            },
         };
         self.builder.deinit();
         return built;

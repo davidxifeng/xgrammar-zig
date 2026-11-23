@@ -486,3 +486,125 @@ test "lexer_error_cases" {
     // Rule name not at the beginning of the line
     try expect_lex_error("token token ::= expr", "The rule name should be at the beginning of the line");
 }
+
+// ---------------------------------------------------------------------------
+// EBNF parser: Regex macro flag handling (needs fsm::rewrite_regex_dots only;
+// no Grammar fsm hooks, so these run unconditionally).
+// ---------------------------------------------------------------------------
+
+fn regex_expr_of(grammar: anytype) @TypeOf(grammar.expr(0)) {
+    // rule body = choices -> sequence -> the single Regex element
+    const choices = grammar.expr(grammar.rule(0).body_expr_id);
+    const sequence = grammar.expr(choices.data[0]);
+    return grammar.expr(sequence.data[0]);
+}
+
+fn regex_pattern_of(input: []const u8) []u8 {
+    const gpa = testing.allocator;
+    const grammar = parser.ebnf_to_grammar_no_normalization(gpa, input, "root", null) catch unreachable;
+    defer grammar.deinit();
+    const body = regex_expr_of(grammar);
+    return body.regex_pattern(gpa) catch unreachable;
+}
+
+fn regex_pattern_fails(input: []const u8) []u8 {
+    const gpa = testing.allocator;
+    var diag = parser.ebnf_error.EbnfErrorInfo{ .normalization = "" };
+    if (parser.ebnf_to_grammar_no_normalization(gpa, input, "root", &diag)) |_| {
+        unreachable; // expected a parser failure
+    } else |e| switch (e) {
+        error.Parser => {
+            const message = gpa.dupe(u8, diag.parser.message) catch unreachable;
+            if (diag.parser.message.len > 0) gpa.free(diag.parser.message);
+            return message;
+        },
+        else => unreachable,
+    }
+}
+
+test "regex macro without flags stores the pattern verbatim" {
+    const gpa = testing.allocator;
+    const pattern = regex_pattern_of("root ::= Regex(\"a.c\")");
+    defer gpa.free(pattern);
+    try testing.expectEqualStrings("a.c", pattern);
+}
+
+test "regex macro dot-all flag keeps dots" {
+    const gpa = testing.allocator;
+    const pattern = regex_pattern_of("root ::= Regex(\"a.c\", flags=\"s\")");
+    defer gpa.free(pattern);
+    try testing.expectEqualStrings("a.c", pattern);
+}
+
+test "regex macro default dot semantics rewrite dots to not-newline" {
+    const gpa = testing.allocator;
+    const pattern = regex_pattern_of("root ::= Regex(\"a.c\", flags=\"i\")");
+    defer gpa.free(pattern);
+    try testing.expectEqualStrings("(?i)a[^\\n]c", pattern);
+}
+
+test "regex macro unicode flag alone still rewrites dots (flags presence opts in)" {
+    const gpa = testing.allocator;
+    const pattern = regex_pattern_of("root ::= Regex(\"a.c\", flags=\"u\")");
+    defer gpa.free(pattern);
+    try testing.expectEqualStrings("a[^\\n]c", pattern);
+}
+
+test "regex macro case-insensitive plus dot-all" {
+    const gpa = testing.allocator;
+    const pattern = regex_pattern_of("root ::= Regex(\"a.c\", flags=\"is\")");
+    defer gpa.free(pattern);
+    try testing.expectEqualStrings("(?i)a.c", pattern);
+}
+
+test "regex macro rejects unsupported flags" {
+    const gpa = testing.allocator;
+    const message = regex_pattern_fails("root ::= Regex(\"a\", flags=\"x\")");
+    defer gpa.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "regular-expression flag 'x' is not supported") != null);
+}
+
+test "regex macro json_string argument is honored" {
+    const gpa = testing.allocator;
+    const input = "root ::= Regex(\"a\", json_string=true)";
+    const grammar = parser.ebnf_to_grammar_no_normalization(gpa, input, "root", null) catch unreachable;
+    defer grammar.deinit();
+    const body = regex_expr_of(grammar);
+    try testing.expect(body.regex_is_json_string());
+}
+
+// ---------------------------------------------------------------------------
+// Earley parser: the FSM runtime is wired to `Grammar.complete_fsm` /
+// `Grammar.per_rule_fsms` (WaveGrammar's hooks). Until those fields are
+// installed the constructor surfaces `error.FsmNotInstalled`; this suite
+// un-gates automatically once they land (解除条件: 字段安装 + 编译器波提供
+// optimize 后的 grammar;当前由 fsm/compiler 波的集成测试覆盖端到端路径).
+// ---------------------------------------------------------------------------
+test "earley parser fsm hook gate" {
+    const EarleyParser = parser.EarleyParser;
+    const installed = comptime parser.earley_parser.grammar_fsm_installed;
+    if (!installed) {
+        // Constructing a parser over a grammar without fsm hooks reports the gate.
+        var builder = try parser.earley_parser.GrammarBuilder.new(testing.allocator);
+        defer builder.deinit();
+        const bs = try builder.add_byte_string("a");
+        _ = try builder.add_rule_named("root", bs);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const grammar = try builder.into_grammar_with_root_id(arena.allocator(), 0);
+        defer grammar.deinit();
+        grammar.set_optimized(true);
+        if (EarleyParser.new(testing.allocator, grammar, null)) |p| {
+            p.deinit();
+            return error.TestUnexpectedResult; // hooks installed but gate constant says otherwise
+        } else |e| switch (e) {
+            error.FsmNotInstalled => {},
+            else => return e,
+        }
+        return;
+    }
+    // Hooks installed: run a real advance over an optimized grammar once the
+    // compiler wave can produce one; until then the FSM runtime paths are
+    // exercised by the fsm/compiler integration tests.
+    return error.SkipZigTest; // 解除: WaveGrammar 字段 + compiler.optimize 落地后编写端到端断言
+}

@@ -41,6 +41,7 @@ pub const TokenTagDispatch = token_tag_dispatch.TokenTagDispatch;
 test {
     _ = character_class_element;
     _ = error_mod;
+    _ = @import("serialization_spec_test.zig");
     _ = grammar;
     _ = grammar_builder;
     _ = grammar_expr;

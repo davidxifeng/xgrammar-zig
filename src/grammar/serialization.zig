@@ -26,13 +26,17 @@ const DeserializeErrorInfo = error_mod.DeserializeErrorInfo;
 const support = @import("../support/mod.zig");
 const Compact2dArray = support.Compact2dArray;
 const config = @import("../config.zig");
+const fsm_mod = @import("../fsm/mod.zig");
+const CompactFsm = fsm_mod.CompactFsm;
+const CompactFsmWithStartEnd = fsm_mod.CompactFsmWithStartEnd;
+const CompactFsmWithStartEndWithSize = fsm_mod.CompactFsmWithStartEndWithSize;
+const fsm_ser = fsm_mod.serialization;
 
-/// Errors of the serialize path (`NotImplementedInWaveFsm`: the fsm members are installed
-/// by the fsm wave; see the registered unlinked edges in the delivery report).
-pub const SerializeError = Allocator.Error || error{NotImplementedInWaveFsm};
+/// Errors of the serialize path.
+pub const SerializeError = Allocator.Error;
 
 /// Errors of the deserialize path.
-pub const DeserializeErrorAll = DeserializeError || support.Compact2dArrayError || Allocator.Error || error{NotImplementedInWaveFsm};
+pub const DeserializeErrorAll = DeserializeError || support.Compact2dArrayError || Allocator.Error;
 
 /// Serializes the grammar to its `"v16"` JSON form (FSMs are `null`/`[]` until optimized).
 /// The returned slice is allocated from `allocator`.
@@ -97,19 +101,23 @@ pub fn serialize_json_value_embedded(grammar: *const Grammar, allocator: Allocat
     }
 
     const with_fsm = grammar.is_optimized();
+    var complete_fsm_value: Value = .null;
+    var per_rule_fsms = std.json.Array.init(allocator);
     if (with_fsm) {
-        // fsm-wave members (`complete_fsm`, `per_rule_fsms`) are not installed yet —
-        // registered unlinked edge (reference serialization.rs lines 99–118).
-        return error.NotImplementedInWaveFsm;
+        complete_fsm_value = try fsm_ser.serialize_compact_fsm_json_value(grammar.complete_fsm, allocator);
+        for (grammar.per_rule_fsms_slice()) |maybe| {
+            if (maybe) |*view|
+                try per_rule_fsms.append(try fsm_ser.serialize_compact_fsm_with_start_end_with_size_json_value(view, allocator))
+            else
+                try per_rule_fsms.append(.null);
+        }
     }
-
-    const per_rule_fsms = std.json.Array.init(allocator); // empty until optimized
 
     var object = std.json.ObjectMap.empty;
     // Keys inserted in lexicographic order to match serde_json's BTreeMap serialization
     // (契约对拍陷阱 1).
     try object.put(allocator, "allow_empty_rule_ids", try i32_slice_value(allocator, grammar.allow_empty_rule_ids.items));
-    try object.put(allocator, "complete_fsm", .null);
+    try object.put(allocator, "complete_fsm", complete_fsm_value);
     try object.put(allocator, "grammar_expr_data", .{ .array = data });
     try object.put(allocator, "grammar_expr_indptr", .{ .array = indptr });
     try object.put(allocator, "optimized", .{ .bool = grammar.is_optimized() });
@@ -369,10 +377,63 @@ fn deserialize_json_value_impl(
     const per_rule_json = array_of(&per_rule_json_field) orelse
         return fail_format(backing, diag, "invalid format: expected array", .{});
     if (!complete_fsm_is_null or per_rule_json.items.len != 0) {
-        // fsm-wave members: `CompactFsm`/`CompactFsmWithStartEnd(WithSize)` decode and the
-        // shared-view rebuild are registered unlinked edges
-        // (reference serialization.rs lines 197–222).
-        return error.NotImplementedInWaveFsm;
+        // Generated views share the complete FSM; independently serialized rule graphs stay
+        // distinct (reference serialization.rs lines 219–232). FSM storage lives in the
+        // grammar's arena so it dies with the grammar (refcounts stay correct).
+        const galloc = grammar.arena.allocator();
+        var complete = if (complete_fsm_is_null)
+            try CompactFsm.empty(galloc)
+        else
+            try fsm_ser.deserialize_compact_fsm_json_value(galloc, complete_fsm);
+        var per_rule: std.ArrayList(?CompactFsmWithStartEndWithSize) = .empty;
+        var installed = false;
+        // On any failure the still-unowned handles are released here (arena frees are
+        // individually no-ops, so releasing only the caller-side refs is always safe).
+        defer if (!installed) {
+            complete.deinit();
+            for (per_rule.items) |*maybe| {
+                if (maybe.*) |*view| view.deinit();
+            }
+            per_rule.deinit(galloc);
+        };
+        for (per_rule_json.items) |entry| {
+            if (entry == .null) {
+                try per_rule.append(galloc, null);
+                continue;
+            }
+            var view = try fsm_ser.deserialize_compact_fsm_with_start_end_with_size_json_value(galloc, entry);
+            var moved = false;
+            defer if (!moved) view.deinit();
+            const view_fsm = view.get_fsm();
+            if (!view_fsm.get_fsm().eql(complete)) {
+                try per_rule.append(galloc, view);
+                moved = true;
+                continue;
+            }
+            // Rebuild the view over the complete FSM's storage (shared-handle clone).
+            var ends: std.ArrayList(i32) = .empty;
+            try ends.appendSlice(galloc, view_fsm.get_ends());
+            const shared = try CompactFsmWithStartEnd.new(
+                galloc,
+                complete.clone(),
+                view_fsm.get_start(),
+                ends,
+                view_fsm.get_is_dfa(),
+            );
+            const rebuilt = CompactFsmWithStartEndWithSize.new(shared, view.get_edge_num(), view.get_node_num());
+            view.deinit();
+            moved = true;
+            try per_rule.append(galloc, rebuilt);
+        }
+        try grammar.set_fsms(complete, per_rule.items);
+        installed = true;
+        // The grammar retained its own references; drop the caller-side ones
+        // (`per_rule.deinit` frees the buffer only, the loop releases the handles).
+        complete.deinit();
+        for (per_rule.items) |*maybe| {
+            if (maybe.*) |*view| view.deinit();
+        }
+        per_rule.deinit(galloc);
     }
     grammar.set_optimized(optimized);
     try validate(grammar, backing, diag, !complete_fsm_is_null);
@@ -386,7 +447,7 @@ fn validate(
     backing: Allocator,
     diag: ?*DeserializeErrorInfo,
     has_complete_fsm: bool,
-) (DeserializeError || error{NotImplementedInWaveFsm})!void {
+) DeserializeError!void {
     const num_rules = grammar.num_rules();
     const num_exprs = grammar.num_exprs();
 
@@ -474,11 +535,60 @@ fn validate(
             return fail_format(backing, diag, "invalid format: allow_empty_rule_ids refers to a rule out of range", .{});
     }
 
-    // fsm-dependent checks: the parser reads repeat info of a per-rule FSM edge from
-    // complete_fsm, and an optimized grammar must carry complete_fsm plus one FSM per rule
-    // (reference serialization.rs lines 353–396). They need the fsm-wave members.
-    if (has_complete_fsm or grammar.is_optimized())
-        return error.NotImplementedInWaveFsm;
+    // The parser reads the repeat info of a per-rule FSM edge from complete_fsm, so the
+    // aux indices of per-rule repeat edges must also be valid for complete_fsm
+    // (reference serialization.rs lines 334–396).
+    const complete_aux = grammar.complete_fsm.edge_aux_data();
+    const FsmRulesOk = struct {
+        fn check(fsm: CompactFsm, num_rules_count: i32) bool {
+            const aux = fsm.edge_aux_data();
+            var state: i32 = 0;
+            while (state < fsm.num_states()) : (state += 1) {
+                for (fsm.state_edges(state)) |edge| {
+                    if (edge.is_rule_ref() and !rule_ok(edge.max, num_rules_count)) return false;
+                    if (edge.is_repeat_ref()) {
+                        const index = std.math.cast(usize, edge.max) orelse return false;
+                        if (index >= aux.len or !rule_ok(aux[index], num_rules_count)) return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }.check;
+    if (has_complete_fsm and !FsmRulesOk(grammar.complete_fsm, num_rules))
+        return fail_format(backing, diag, "invalid format: complete_fsm refers to a rule out of range", .{});
+    const per_rule_fsms = grammar.per_rule_fsms_slice();
+    if (grammar.is_optimized()) {
+        if (!has_complete_fsm or per_rule_fsms.len != @as(usize, @intCast(num_rules)))
+            return fail_format(backing, diag, "invalid format: An optimized grammar must have complete_fsm and one FSM per rule", .{});
+    }
+    for (per_rule_fsms, 0..) |maybe, rule_index| {
+        const view = maybe orelse {
+            if (grammar.is_optimized())
+                return fail_format(backing, diag, "invalid format: Rule {d} has no FSM in an optimized grammar", .{rule_index});
+            continue;
+        };
+        const fsm = view.get_fsm().get_fsm();
+        if (!FsmRulesOk(fsm, num_rules))
+            return fail_format(backing, diag, "invalid format: The FSM of rule {d} refers to a rule out of range", .{rule_index});
+        var repeat_ok = true;
+        var state: i32 = 0;
+        while (repeat_ok and state < fsm.num_states()) : (state += 1) {
+            for (fsm.state_edges(state)) |edge| {
+                if (!edge.is_repeat_ref()) continue;
+                const index = std.math.cast(usize, edge.max) orelse {
+                    repeat_ok = false;
+                    break;
+                };
+                if (!(index + 3 <= complete_aux.len and rule_ok(complete_aux[index], num_rules))) {
+                    repeat_ok = false;
+                    break;
+                }
+            }
+        }
+        if (!repeat_ok)
+            return fail_format(backing, diag, "invalid format: The FSM of rule {d} has a repeat edge that is out of range of complete_fsm", .{rule_index});
+    }
 }
 
 test "serialize deserialize roundtrip" {
@@ -683,4 +793,62 @@ test "deserialize errors: version, missing version, arity, sorted infos, bad ref
         defer parsed.deinit();
         try std.testing.expectEqual(@as(i32, 1), parsed.num_rules());
     }
+}
+
+test "optimized grammar roundtrip with complete, shared and distinct rule fsms" {
+    const backing = std.testing.allocator;
+    const Fsm = fsm_mod.Fsm;
+    const grammar_builder_mod = @import("grammar_builder.zig");
+    var builder = try grammar_builder_mod.GrammarBuilder.new(backing);
+    defer builder.deinit();
+    _ = try builder.add_rule_named("r0", try builder.add_empty_str());
+    _ = try builder.add_rule_named("r1", try builder.add_empty_str());
+    const grammar = try builder.into_grammar_with_root_id(backing, 0);
+    defer grammar.deinit();
+
+    // complete: 0 -a-> 1, 0 -e-> 1
+    var fsm = try Fsm.new(backing, 2);
+    defer fsm.deinit();
+    try fsm.add_edge(0, 1, 'a', 'a');
+    try fsm.add_epsilon_edge(0, 1);
+    var complete = try CompactFsm.from_fsm(backing, &fsm);
+    defer complete.deinit();
+    // distinct for rule 1: 0 -b-> 1
+    var fsm2 = try Fsm.new(backing, 2);
+    defer fsm2.deinit();
+    try fsm2.add_edge(0, 1, 'b', 'b');
+    var distinct = try CompactFsm.from_fsm(backing, &fsm2);
+    defer distinct.deinit();
+
+    var ends0: std.ArrayList(i32) = .empty;
+    try ends0.append(backing, 1);
+    const view0 = try CompactFsmWithStartEnd.new(backing, complete.clone(), 0, ends0, false);
+    var ends1: std.ArrayList(i32) = .empty;
+    try ends1.append(backing, 1);
+    const view1 = try CompactFsmWithStartEnd.new(backing, distinct.clone(), 0, ends1, false);
+    var sized0 = CompactFsmWithStartEndWithSize.new(view0, 1, 2);
+    defer sized0.deinit();
+    var sized1 = CompactFsmWithStartEndWithSize.new(view1, 1, 2);
+    defer sized1.deinit();
+
+    try grammar.set_fsms(complete, &.{ sized0, sized1 });
+    grammar.set_optimized(true);
+
+    var ser_arena = std.heap.ArenaAllocator.init(backing);
+    defer ser_arena.deinit();
+    const sa = ser_arena.allocator();
+    const json = try serialize_json(grammar, sa);
+
+    const parsed = try deserialize_json(backing, json, null);
+    defer parsed.deinit();
+    try std.testing.expect(grammar.eql(parsed));
+    try std.testing.expect(parsed.is_optimized());
+    try std.testing.expect(parsed.complete_fsm.eql(complete));
+    // Rule 0's view was rebuilt over the complete FSM's storage; rule 1's stayed distinct.
+    try std.testing.expect(parsed.per_rule_fsm(0).?.get_fsm().get_fsm().shares_storage(parsed.complete_fsm));
+    try std.testing.expect(!parsed.per_rule_fsm(1).?.get_fsm().get_fsm().shares_storage(parsed.complete_fsm));
+    try std.testing.expectEqual(@as(i32, 1), parsed.per_rule_fsm(1).?.get_edge_num());
+    try std.testing.expectEqual(@as(i32, 2), parsed.per_rule_fsm(1).?.get_node_num());
+    const json2 = try serialize_json(parsed, sa);
+    try std.testing.expectEqualStrings(json, json2);
 }
