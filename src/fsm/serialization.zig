@@ -16,9 +16,9 @@ const compact_fsm_with_start_end_mod = @import("compact_fsm_with_start_end.zig")
 const CompactFsmWithStartEnd = compact_fsm_with_start_end_mod.CompactFsmWithStartEnd;
 const compact_fsm_with_start_end_with_size_mod = @import("compact_fsm_with_start_end_with_size.zig");
 const CompactFsmWithStartEndWithSize = compact_fsm_with_start_end_with_size_mod.CompactFsmWithStartEndWithSize;
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const Compact2dArray = support.Compact2dArray;
-const grammar_error = @import("grammar/error.zig");
+const grammar_error = @import("../grammar/error.zig");
 const DeserializeError = grammar_error.DeserializeError;
 
 pub const Value = std.json.Value;
@@ -230,14 +230,15 @@ test "compact fsm serialization roundtrip" {
         break :blk ends;
     }, false);
     defer wse.deinit();
-    const with_size = CompactFsmWithStartEndWithSize.new(wse.clone(a), 4, 2);
-    defer @constCast(&with_size).deinit();
+    var with_size = CompactFsmWithStartEndWithSize.new(try wse.clone(a), 4, 2);
+    defer with_size.deinit();
 
     const value = try serialize_compact_fsm_with_start_end_with_size_json_value(&with_size, a);
 
     var recovered = try deserialize_compact_fsm_with_start_end_with_size_json_value(a, value);
     defer recovered.deinit();
-    try std.testing.expect(try recovered.get_fsm().accept_string("ab"));
+    try std.testing.expect(try recovered.get_fsm().accept_string("a"));
+    try std.testing.expect(!try recovered.get_fsm().accept_string("ab"));
     try std.testing.expectEqual(@as(i32, 4), recovered.get_edge_num());
     try std.testing.expectEqual(@as(i32, 2), recovered.get_node_num());
 

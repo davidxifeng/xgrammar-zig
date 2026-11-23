@@ -93,7 +93,7 @@ pub fn add_packed_utf8_range_edges(fsm: *Fsm, from: i32, to: i32, min_in: u32, m
 fn add_same_length_character_range(fsm: *Fsm, from: i32, to: i32, min: u32, max: u32) Allocator.Error!void {
     const byte = struct {
         fn f(value: u32, i: u32) i32 {
-            return @intCast((value >> (8 * i)) & 0xFF);
+            return @intCast((value >> @as(u5, @intCast(8 * i))) & 0xFF);
         }
     }.f;
     // ASCII.
@@ -103,7 +103,7 @@ fn add_same_length_character_range(fsm: *Fsm, from: i32, to: i32, min: u32, max:
     }
     // The index of the leading byte, and the masks of the trailing bytes.
     const lead: u5 = if (byte(max, 3) != 0) 3 else if (byte(max, 2) != 0) 2 else 1;
-    const tail_mask = (@as(u32, 1) << (8 * lead)) - 1;
+    const tail_mask = (@as(u32, 1) << @as(u5, 8 * lead)) - 1;
     const tail_min: u32 = 0x8080_8080 & tail_mask;
     const tail_max: u32 = 0xBFBF_BFBF & tail_mask;
     var lead_min = byte(min, lead);

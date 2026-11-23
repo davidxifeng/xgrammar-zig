@@ -166,3 +166,34 @@
      `zig test src/parser/mod.zig` 75/75 绿(含 spec 测试 15 个 test 函数);
      集成时删 symlink 并把 parser 内 `@import("support/mod.zig")` /
      `@import("grammar/mod.zig")` 改回 `../support/mod.zig` / `../grammar/mod.zig`。
+
+5. **fsm 波次(WaveFsm)**:
+   - 开发期 symlink:src/fsm/{support,grammar,config.zig} → ../(同 parser 波约定);模块内
+     import 为 `support/mod.zig` / `grammar/mod.zig` / `grammar/error.zig`;集成时删 symlink
+     并改回 `../` 前缀。独立测试 `zig test src/fsm/mod.zig` 102 项全绿(91 过 + 11 跳过)。
+   - `Result<_, String>`:regex parse/build 路径保留逐字错误消息——
+     `RegexIr.parse` / `RegexIr.build` / `RegexFsmBuilder.build(_with_forbidden_chars)` /
+     `matches_empty` 增加 `err_msg: ?*?[]u8` 出参(调用方 allocator 分配);错误集
+     `RegexError = OOM || {RegexParse, RepeatTooLarge, InvalidRepeat, RepeatCountInvalid,
+     UnclosedParen, InvalidEscape}`。`not`/`intersect(_with_limit)`/`to_dfa(_with_limit)`/
+     `minimize_dfa` 消息文本丢弃:`error.NotLeaf` / `error.StateLimitExceeded`。
+   - 所有权:Fsm/FsmWithStartEnd 等无 arena,方法显式 `allocator` 首参(或持 `self.allocator`),
+     所有增长型方法返回 `Allocator.Error!`(Rust OOM panic);`deinit` 释放自身。
+   - `CompactFsm` 的 `Arc` 对 → 引用计数共享块 `CompactFsmShared{allocator, refs, edges,
+     edge_aux_data}`;`clone(self)` 只增引用计数(无 allocator 参数,偏离 Clone 约定);
+     `shares_storage` = 指针等同;`eql` 逐字段比较。`from_parts`/`edges_table`(原 pub(crate))
+     改为 pub。
+   - 访问器与字段/方法重名:取值器加 `get_` 前缀(`get_start`/`get_ends`/`get_fsm`/
+     `get_is_dfa`/`get_edge_num`/`get_node_num`);`Fsm.edges()`→`edges_slice()`,
+     `edge_aux_data()`→`edge_aux_data_slice()`;`FsmWithStartEnd.union` → `union_`。
+   - `BTreeSet`/`BTreeMap` 遍历序:to_dfa 的 interval_ends 用排序去重线性表;
+     minimize_dfa 的 possible 用排序组表;suffix_automata 展开 chunk 转移前按字典序排序
+     (陷阱 1 同源)。
+   - serialization:std.json ObjectMap 按字典序插入(CompactFsm 键序 edge_aux_data <
+     edge_num < edges);形状错误统一 `DeserializeError.Format`;FsmEdge.deserialize 的
+     消息文本丢弃;JSON Value 无递归释放,序列化往返测试用 arena。
+   - merge_equivalent_states 的 EndpointEdge CSR 行显式零默认(init_from_row_sizes 需 default)。
+   - spec 测试:test_fsm.rs 全量译入 spec_test_fsm.zig;test_fsm_builder.rs 译入
+     spec_test_fsm_builder.zig(其中 GrammarFsmBuilder 相关 7 组用例与
+     test_regular_grammar_fsm.rs 全部 4 组用例依赖 functor/matcher 波,译好并 gating 为
+     `error.SkipZigTest`,functor 落地后去掉 gating)。

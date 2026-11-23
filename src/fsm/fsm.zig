@@ -14,7 +14,7 @@ pub const TokenEdgeRef = fsm_edge.TokenEdgeRef;
 pub const ExcludeTokenEdgeRef = fsm_edge.ExcludeTokenEdgeRef;
 const sortEdges = fsm_edge.sortEdges;
 
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const encoding = support.encoding;
 
 /// Sentinel returned by `Fsm.next_state` when no transition exists.
@@ -410,9 +410,9 @@ pub const Fsm = struct {
         const old_len = self.edges.items.len;
         try self.edges.resize(self.allocator, old_len + other.edges.items.len);
         for (old_len..self.edges.items.len) |i| self.edges.items[i] = .empty;
-        for (other.edges.items, 0..) |_, i| {
+        for (other.edges.items, 0..) |other_row, i| {
             const from = old_num_states + @as(i32, @intCast(i));
-            for (state_edges.items) |e| {
+            for (other_row.items) |e| {
                 const max: i32 = if (e.is_aux_edge() and aux_offset > 0) e.max + aux_offset else e.max;
                 try self.edges.items[@intCast(from)].append(
                     self.allocator,
@@ -428,8 +428,8 @@ pub const Fsm = struct {
     pub fn rebuild_with_mapping(self: *const Fsm, allocator: Allocator, state_mapping: []const i32, new_num_states: i32) Allocator.Error!Fsm {
         var new_edges = try allocator.alloc(std.ArrayList(FsmEdge), @intCast(new_num_states));
         for (new_edges) |*e| e.* = .empty;
-        for (self.edges.items, 0..) |_, i| {
-            for (state_edges.items) |e| {
+        for (self.edges.items, 0..) |src_row, i| {
+            for (src_row.items) |e| {
                 if (e.is_epsilon() and state_mapping[i] == state_mapping[@intCast(e.target)]) continue;
                 try new_edges[@intCast(state_mapping[i])].append(
                     allocator,

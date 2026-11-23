@@ -3,7 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const encoding = support.encoding;
 
 /// The largest Unicode codepoint.
@@ -134,7 +134,7 @@ pub const RegexEscape = union(enum) {
                 const decoded = encoding.parse_next_utf8(regex[pos.* - 1 ..]) catch
                     return invalid(err_msg, "Invalid UTF-8 in regex escape sequence");
                 pos.* += decoded.consumed - 1;
-                return .{ .Single = decoded.codepoint };
+                return .{ .Single = @intCast(decoded.codepoint) };
             },
             else => {
                 return .{ .Single = escaped };

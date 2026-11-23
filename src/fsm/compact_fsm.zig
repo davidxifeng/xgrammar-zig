@@ -15,7 +15,7 @@ const state_set_from = fsm_mod.state_set_from;
 const fsm_edge_mod = @import("fsm_edge.zig");
 const FsmEdge = fsm_edge_mod.FsmEdge;
 const sortEdges = fsm_edge_mod.sortEdges;
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const Compact2dArray = support.Compact2dArray;
 
 /// The shared immutable storage behind one or more `CompactFsm` handles
@@ -75,7 +75,7 @@ pub const CompactFsm = struct {
 
     /// Expands back into an adjacency-list `Fsm`. The caller owns the result.
     pub fn to_fsm(self: CompactFsm, allocator: Allocator) Allocator.Error!Fsm {
-        var edges = try allocator.alloc(std.ArrayList(FsmEdge), self.num_states());
+        const edges = try allocator.alloc(std.ArrayList(FsmEdge), @intCast(self.num_states()));
         for (edges) |*e| e.* = .empty;
         for (edges, 0..) |*e, i| {
             try e.appendSlice(allocator, self.state_edges(@intCast(i)));
@@ -107,9 +107,15 @@ pub const CompactFsm = struct {
 
     /// Whether two FSMs have equal contents (the derived Rust `PartialEq`).
     pub fn eql(self: CompactFsm, other: CompactFsm) bool {
-        return std.mem.eql(i32, self.shared.edge_aux_data, other.shared.edge_aux_data) and
-            std.mem.eql(i32, self.shared.edges.indptr_slice(), other.shared.edges.indptr_slice()) and
-            std.mem.eql(FsmEdge, self.shared.edges.data_slice(), other.shared.edges.data_slice());
+        if (!std.mem.eql(i32, self.shared.edge_aux_data, other.shared.edge_aux_data)) return false;
+        if (!std.mem.eql(i32, self.shared.edges.indptr_slice(), other.shared.edges.indptr_slice())) return false;
+        const a = self.shared.edges.data_slice();
+        const b = other.shared.edges.data_slice();
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x.min != y.min or x.max != y.max or x.target != y.target) return false;
+        }
+        return true;
     }
 
     /// The number of states.
@@ -134,8 +140,8 @@ pub const CompactFsm = struct {
 
     /// Rebuilds a compact FSM from serialized CSR parts (the Rust `pub(crate) from_parts`;
     /// made public — the JSON deserializer in serialization.zig uses it).
-    pub fn from_parts(allocator: Allocator, edges: Compact2dArray(FsmEdge), edge_aux_data: []i32) Allocator.Error!CompactFsm {
-        return .{ .shared = try CompactFsmShared.create(allocator, edges, edge_aux_data) };
+    pub fn from_parts(allocator: Allocator, edges: Compact2dArray(FsmEdge), aux_data: []i32) Allocator.Error!CompactFsm {
+        return .{ .shared = try CompactFsmShared.create(allocator, edges, aux_data) };
     }
 
     /// Borrow the CSR edge table (used by JSON serialization; Rust `pub(crate) edges_table`).
@@ -232,7 +238,7 @@ test "compact roundtrip and sharing" {
     defer compact2.deinit();
     try std.testing.expect(compact.eql(compact2));
     try std.testing.expect(!compact.shares_storage(compact2));
-    const cloned = compact.clone();
+    var cloned = compact.clone();
     defer cloned.deinit();
     try std.testing.expect(compact.shares_storage(cloned));
 }

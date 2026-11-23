@@ -21,6 +21,7 @@ pub const CompactFsmWithStartEnd = struct {
     /// Creates a compact FSM-with-start/end from its parts. `ends` need not be sorted or
     /// deduplicated (the list is consumed).
     pub fn new(allocator: Allocator, fsm: CompactFsm, start: i32, ends_in: std.ArrayList(i32), is_dfa: bool) Allocator.Error!CompactFsmWithStartEnd {
+        _ = allocator;
         var ends = ends_in;
         std.mem.sortUnstable(i32, ends.items, {}, std.sort.asc(i32));
         var write: usize = 0;

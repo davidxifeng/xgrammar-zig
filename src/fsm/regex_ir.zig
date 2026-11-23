@@ -22,9 +22,9 @@ const regex_node_mod = @import("regex_node.zig");
 const RegexNode = regex_node_mod.RegexNode;
 const regex_stack_entry_mod = @import("regex_stack_entry.zig");
 const RegexStackEntry = regex_stack_entry_mod.RegexStackEntry;
-const grammar_builder_mod = @import("grammar/mod.zig");
+const grammar_builder_mod = @import("../grammar/mod.zig");
 const GrammarBuilder = grammar_builder_mod.GrammarBuilder;
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const encoding = support.encoding;
 
 const REPEAT_NO_UPPER_BOUND: i32 = -1;
@@ -48,6 +48,8 @@ pub const RegexError = Allocator.Error || error{
     RepeatCountInvalid,
     /// A `(` was left open (`split_branches` payload).
     UnclosedParen,
+    /// Propagated from `RegexEscape.parse` (already reported via `err_msg`).
+    InvalidEscape,
 };
 
 /// A parsed regex: the top-level sequence and the flags.
@@ -233,8 +235,9 @@ pub const RegexIr = struct {
                     }
                     const open_idx = open orelse return parse_ctx.fail(i, "Unmatched ')'");
                     const content = stack.items[open_idx + 1 ..];
-                    var branches = split_branches(allocator, content) catch |e| switch (e) {
-                        error.UnclosedParen => return parse_ctx.fail(group_begin, "The parenthesis is not closed"),
+                    var group_open_at: usize = 0;
+                    var branches = split_branches(allocator, content, &group_open_at) catch |e| switch (e) {
+                        error.UnclosedParen => return parse_ctx.fail(group_open_at, "The parenthesis is not closed"),
                         else => return e,
                     };
                     // The consumed stack entries (open marker and content) are freed below;
@@ -244,7 +247,7 @@ pub const RegexIr = struct {
                     // An empty group or an empty alternative matches the empty string.
                     var node: RegexNode = undefined;
                     if (branches.items.len == 1) {
-                        const only = branches.items[0];
+                        var only = branches.items[0];
                         const bracket = try allocator.alloc(RegexNode, only.items.len);
                         @memcpy(bracket, only.items);
                         only.deinit(allocator);
@@ -253,9 +256,10 @@ pub const RegexIr = struct {
                     } else {
                         const union_nodes = try allocator.alloc(RegexNode, branches.items.len);
                         for (branches.items, 0..) |branch, bi| {
-                            const bracket = try allocator.alloc(RegexNode, branch.items.len);
-                            @memcpy(bracket, branch.items);
-                            branch.deinit(allocator);
+                            var branch_mut = branch;
+                            const bracket = try allocator.alloc(RegexNode, branch_mut.items.len);
+                            @memcpy(bracket, branch_mut.items);
+                            branch_mut.deinit(allocator);
                             union_nodes[bi] = .{ .Bracket = bracket };
                         }
                         branches.deinit(allocator);
@@ -276,7 +280,7 @@ pub const RegexIr = struct {
                     }
                     const repeat_begin = i;
                     var repeat_plain: ?[]u8 = null;
-                    const repeat = check_repeat(allocator, regex, &i, &repeat_plain) catch |e| switch (e) {
+                    var repeat = check_repeat(allocator, regex, &i, &repeat_plain) catch |e| switch (e) {
                         error.InvalidRepeat, error.RepeatCountInvalid => {
                             if (err_msg) |m| {
                                 m.* = std.fmt.allocPrint(
@@ -384,13 +388,14 @@ pub const RegexIr = struct {
             }
         }
 
-        var branches = split_branches(allocator, stack.items) catch |e| switch (e) {
+        var group_open_at: usize = 0;
+        var branches = split_branches(allocator, stack.items, &group_open_at) catch |e| switch (e) {
             error.UnclosedParen => {
                 for (stack.items) |entry| {
                     if (entry == .Node) entry.Node.node.deinit(allocator);
                 }
-                stack.deinit(allocator);
-                return parse_ctx.fail(i, "The parenthesis is not closed");
+                stack.items.len = 0; // nodes freed; the errdefer deinits the stack itself
+                return parse_ctx.fail(group_open_at, "The parenthesis is not closed");
             },
             else => return e,
         };
@@ -401,9 +406,10 @@ pub const RegexIr = struct {
         } else {
             const union_nodes = try allocator.alloc(RegexNode, branches.items.len);
             for (branches.items, 0..) |branch, bi| {
-                const bracket = try allocator.alloc(RegexNode, branch.items.len);
-                @memcpy(bracket, branch.items);
-                branch.deinit(allocator);
+                var branch_mut = branch;
+                const bracket = try allocator.alloc(RegexNode, branch_mut.items.len);
+                @memcpy(bracket, branch_mut.items);
+                branch_mut.deinit(allocator);
                 union_nodes[bi] = .{ .Bracket = bracket };
             }
             states = try allocator.alloc(RegexNode, 1);
@@ -493,7 +499,7 @@ pub const RegexIr = struct {
             // copy of the child, whose end states stay accepting.
             return empty_string_fsm(self.allocator);
         }
-        const child_fsm = try self.visit(child, err_msg);
+        var child_fsm = try self.visit(child, err_msg);
         defer child_fsm.deinit();
         var result = try child_fsm.clone(self.allocator);
         errdefer result.deinit();
@@ -501,7 +507,6 @@ pub const RegexIr = struct {
         // edges instead and never reach this point.
         const num_copies: i64 = if (has_upper_bound) upper else @max(lower, 1);
         if (@as(i64, result.num_states()) * num_copies > MAX_UNROLLED_REPEAT_STATES) {
-            result.deinit();
             if (err_msg) |m| {
                 m.* = if (has_upper_bound)
                     std.fmt.allocPrint(self.allocator, "The bounded repetition {{{d},{d}}} is too large to compile into a FSM", .{ lower, upper }) catch |e| return e
@@ -519,7 +524,7 @@ pub const RegexIr = struct {
         if (has_upper_bound) {
             var copy_i: i32 = 2;
             while (copy_i <= upper) : (copy_i += 1) {
-                const child_clone = try child_fsm.clone(self.allocator);
+                var child_clone = try child_fsm.clone(self.allocator);
                 defer child_clone.deinit();
                 var inputs = [_]FsmWithStartEnd{ result, child_clone };
                 result = try FsmWithStartEnd.concat(self.allocator, &inputs);
@@ -529,19 +534,18 @@ pub const RegexIr = struct {
         } else {
             var copy_i: i32 = 2;
             while (copy_i < lower) : (copy_i += 1) {
-                const child_clone = try child_fsm.clone(self.allocator);
+                var child_clone = try child_fsm.clone(self.allocator);
                 defer child_clone.deinit();
                 var inputs = [_]FsmWithStartEnd{ result, child_clone };
                 result = try FsmWithStartEnd.concat(self.allocator, &inputs);
                 inputs[0].deinit();
             }
             if (result.get_ends().len == 0) {
-                result.deinit();
                 if (err_msg) |m| m.* = try self.allocator.dupe(u8, "Internal error: no end state found in the lower bound FSM");
                 return error.RepeatTooLarge;
             }
             const end_of_lower_bound = result.get_ends()[0];
-            const child_clone = try child_fsm.clone(self.allocator);
+            var child_clone = try child_fsm.clone(self.allocator);
             defer child_clone.deinit();
             var inputs = [_]FsmWithStartEnd{ result, child_clone };
             result = try FsmWithStartEnd.concat(self.allocator, &inputs);
@@ -770,7 +774,15 @@ fn empty_string_fsm(allocator: Allocator) Allocator.Error!FsmWithStartEnd {
 
 /// Splits stack entries (left to right) at the alternations into branches. Errors with
 /// `error.UnclosedParen` (the Rust `usize` payload becomes the caller-reported position).
-fn split_branches(allocator: Allocator, entries: []const RegexStackEntry) Allocator.Error!std.ArrayList(std.ArrayList(RegexNode)) {
+fn split_branches(allocator: Allocator, entries: []const RegexStackEntry, open_at: *usize) (Allocator.Error || error{UnclosedParen})!std.ArrayList(std.ArrayList(RegexNode)) {
+    // Pre-scan: if a `(` was left open, report its offset without moving any node out of the
+    // caller's stack (the caller's errdefer keeps ownership; the Rust path drops everything).
+    for (entries) |entry| {
+        if (entry == .GroupOpen) {
+            open_at.* = entry.GroupOpen;
+            return error.UnclosedParen;
+        }
+    }
     var branches: std.ArrayList(std.ArrayList(RegexNode)) = .empty;
     errdefer {
         for (branches.items) |*b| {
@@ -791,16 +803,7 @@ fn split_branches(allocator: Allocator, entries: []const RegexStackEntry) Alloca
                 try branches.append(allocator, current);
                 current = .empty;
             },
-            .GroupOpen => {
-                for (current.items) |node| node.deinit(allocator);
-                current.deinit(allocator);
-                for (branches.items) |*b| {
-                    for (b.items) |node| node.deinit(allocator);
-                    b.deinit(allocator);
-                }
-                branches.deinit(allocator);
-                return error.UnclosedParen;
-            },
+            .GroupOpen => return error.UnclosedParen,
         }
     }
     try branches.append(allocator, current);
@@ -824,14 +827,14 @@ fn skip_character_class(regex: []const u8, pos_in: usize) ?usize {
 
 /// A `{n}` / `{n,}` / `{n,m}` repetition parsed at `regex[i.*] == '{'`, leaving `i` at the
 /// closing `}`. An unbounded upper bound is `-1`. Message via `err_msg`.
-fn check_repeat(allocator: Allocator, regex: []const u8, i: *usize, err_msg: ?*?[]u8) Allocator.Error!struct { lower: i32, upper: i32 } {
+fn check_repeat(allocator: Allocator, regex: []const u8, i: *usize, err_msg: ?*?[]u8) (Allocator.Error || error{ InvalidRepeat, RepeatCountInvalid })!struct { lower: i32, upper: i32 } {
     const Skip = struct {
         fn skip_spaces(r: []const u8, idx: *usize) void {
             while (idx.* < r.len and r[idx.*] == ' ') idx.* += 1;
         }
     };
     const Parse = struct {
-        fn parse_count(r: []const u8, idx: *usize, slot: ?*?[]u8, a: Allocator) Allocator.Error!?i32 {
+        fn parse_count(r: []const u8, idx: *usize, slot: ?*?[]u8, a: Allocator) (Allocator.Error || error{RepeatCountInvalid})!?i32 {
             const digits_begin = idx.*;
             while (idx.* < r.len and std.ascii.isDigit(r[idx.*])) idx.* += 1;
             const digits = r[digits_begin..idx.*];

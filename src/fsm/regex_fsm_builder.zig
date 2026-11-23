@@ -14,7 +14,7 @@ const FsmWithStartEnd = fsm_with_start_end.FsmWithStartEnd;
 const regex_ir = @import("regex_ir.zig");
 const RegexIr = regex_ir.RegexIr;
 const regex_ir_errors = regex_ir.RegexError;
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 
 /// Converts regexes into FSMs.
@@ -59,7 +59,6 @@ pub const RegexFsmBuilder = struct {
         }
         if (!any) return fsm_wse;
 
-        const fsm = &fsm_wse;
         var new_fsm = try Fsm.new(allocator, @intCast(fsm_wse.num_states()));
         errdefer new_fsm.deinit();
         for (0..@intCast(fsm_wse.num_states())) |state| {

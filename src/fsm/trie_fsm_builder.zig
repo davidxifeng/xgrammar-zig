@@ -165,7 +165,8 @@ pub const TrieFsmBuilder = struct {
                 try dead_states.put(u, {});
             }
             const fail_row: ?[]const i32 = if (u != start) &delta[@intCast(fail[@intCast(u)])] else null;
-            for (delta[@intCast(u)], 0..) |*entry, byte| {
+            const delta_row = &delta[@intCast(u)];
+            for (delta_row, 0..) |*entry, byte| {
                 // Rows of deeper states are untouched so far, so a set entry is a trie child.
                 const fallback: i32 = if (fail_row) |row| row[byte] else start;
                 if (entry.* == NO_NEXT_STATE) {

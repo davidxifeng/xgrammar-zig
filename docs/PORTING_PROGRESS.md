@@ -18,8 +18,8 @@
 ## Wave B(parser / fsm / functor)
 | Rust 文件 | Zig 文件 | 状态 |
 |---|---|---|
-| parser/* (earley_parser 1212、ebnf_parser 824、ebnf_lexer 681 等) | src/parser/* (17 文件 + parser_spec_test.zig) | ✅(fsm 边登记 NotImplementedInWaveFsm) |
-| fsm/* (fsm_with_start_end 998、regex_ir 745、fsm 495 等) | src/fsm/* | ☐ |
+| parser/* (earley_parser 1212、ebnf_parser 824、ebnf_lexer 681 等) | src/parser/* (17 文件 + parser_spec_test.zig) | 🔗 已接线(75/75 绿,集成者复核;fsm 边登记 NotImplementedInWaveFsm) |
+| fsm/* (fsm_with_start_end 998、regex_ir 745、fsm 495、fsm_edge 239、compact_fsm 194、compact_fsm_with_start_end 130、trie_fsm_builder 180、serialization 164、packed_utf8 155、regex_escape 136、regex_node 71、regex_stack_entry 21、regex_fsm_builder 81、suffix_automata 84、rewrite_regex_dots 40、fsm_with_start_end_with_size 57、compact_fsm_with_start_end_with_size 49、mod 39) | src/fsm/* (17 源文件 + 3 spec 测试文件) | ✅(zig test src/fsm/mod.zig 102 项:91 过 + 11 跳过(跳过项为 functor/matcher 未接边的 spec 用例,已译好 gating);集成时删 src/fsm/{support,grammar,config.zig} symlink 并把模块内 import 改回 ../ 前缀) |
 | functor/* (lazy_body_flattener 511、grammar_fsm_hasher 468 等) | src/functor/* | ☐ |
 
 ## Wave C(converter)

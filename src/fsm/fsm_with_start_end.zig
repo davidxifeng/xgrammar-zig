@@ -17,7 +17,7 @@ const state_set_eql = fsm_mod.state_set_eql;
 const fsm_edge = @import("fsm_edge.zig");
 const FsmEdge = fsm_edge.FsmEdge;
 const edge_type = fsm_edge.edge_type;
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const Compact2dArray = support.Compact2dArray;
 const union_find_set = support.union_find_set;
 const UnionFindSet = union_find_set.UnionFindSet;
@@ -499,7 +499,7 @@ pub const FsmWithStartEnd = struct {
 
         var eq_classes = try union_find.get_all_sets(allocator);
         defer {
-            for (eq_classes.items) |*set| set.deinit();
+            for (eq_classes.items) |*set| set.deinit(allocator);
             eq_classes.deinit(allocator);
         }
         if (eq_classes.items.len == 0) {
@@ -946,9 +946,10 @@ fn merge_equivalent_pass(result: *FsmWithStartEnd, allocator: Allocator, union_f
         out_size.* = @intCast(edges.len);
         for (edges) |e| incoming_sizes[@intCast(e.target)] += 1;
     }
-    var incoming = try Compact2dArray(EndpointEdge).init_from_row_sizes(allocator, incoming_sizes, .{});
+    const zero_edge = EndpointEdge{ .peer = 0, .min = 0, .max = 0 };
+    var incoming = try Compact2dArray(EndpointEdge).init_from_row_sizes(allocator, incoming_sizes, zero_edge);
     defer incoming.deinit();
-    var outgoing = try Compact2dArray(EndpointEdge).init_from_row_sizes(allocator, outgoing_sizes, .{});
+    var outgoing = try Compact2dArray(EndpointEdge).init_from_row_sizes(allocator, outgoing_sizes, zero_edge);
     defer outgoing.deinit();
     const incoming_pos = try allocator.alloc(usize, n);
     defer allocator.free(incoming_pos);
@@ -1116,10 +1117,10 @@ fn merge_equivalent_pass(result: *FsmWithStartEnd, allocator: Allocator, union_f
     if (changed) {
         var eq_classes = try union_find.get_all_sets(allocator);
         defer {
-            for (eq_classes.items) |*set| set.deinit();
+            for (eq_classes.items) |*set| set.deinit(allocator);
             eq_classes.deinit(allocator);
         }
-        const old_to_new = try allocator.alloc(i32, result.num_states());
+        const old_to_new = try allocator.alloc(i32, @intCast(result.num_states()));
         defer allocator.free(old_to_new);
         @memset(old_to_new, -1);
         for (eq_classes.items, 0..) |class, i| {
