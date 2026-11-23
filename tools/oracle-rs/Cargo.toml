@@ -1,0 +1,12 @@
+[package]
+name = "oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+xgrammar = { package = "xgrammar-rs", path = "/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xgrammar-rs-0.2.8" }
+serde_json = "1"
+
+[profile.release]
+debug = false
