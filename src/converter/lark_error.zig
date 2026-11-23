@@ -64,13 +64,20 @@ fn render_excerpt(allocator: Allocator, source_line: []const u8, column: i32) Al
 
 /// Builds a located diagnostic, capturing the source line the location points into
 /// (Rust `LarkError::at`).
+/// Stores `info` into a null-initialized diag slot, freeing any previous payload
+/// (callers own `?*?LarkErrorInfo` slots initialized to `null`).
+pub fn set_info(dest: *?LarkErrorInfo, info: LarkErrorInfo, allocator: Allocator) Allocator.Error!void {
+    if (dest.*) |*old| old.deinit(allocator);
+    dest.* = info;
+}
+
 pub fn at(allocator: Allocator, source: []const u8, location: LarkLocation, message: []const u8) Allocator.Error!LarkErrorInfo {
     const bytes = source;
     var line_start: usize = 0;
     var current_line: i32 = 1;
     while (current_line < location.line and line_start < bytes.len) {
         if (std.mem.indexOfScalarPos(u8, bytes, line_start, '\n')) |offset| {
-            line_start += offset + 1;
+            line_start = offset + 1;
             current_line += 1;
         } else {
             line_start = bytes.len;

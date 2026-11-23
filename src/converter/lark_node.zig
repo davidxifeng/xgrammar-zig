@@ -64,7 +64,7 @@ pub const LarkNode = struct {
 
     /// Deep copy into `allocator` (Rust `Clone`); used to hand an inline `%lark` document to
     /// a nested compilation (Rust `LarkDocument::clone`).
-    pub fn clone(self: *const LarkNode, allocator: std.mem.Allocator) std.mem.Allocator!LarkNode {
+    pub fn clone(self: *const LarkNode, allocator: std.mem.Allocator) std.mem.Allocator.Error!LarkNode {
         var node = LarkNode.new(self.kind, self.location);
         node.text = try allocator.dupe(u8, self.text);
         node.text2 = try allocator.dupe(u8, self.text2);
@@ -76,7 +76,9 @@ pub const LarkNode = struct {
             node.children.appendAssumeCapacity(try child.clone(allocator));
         }
         if (self.nested) |nested| {
-            node.nested = try lark_document.LarkDocument.deep_clone(allocator, nested);
+            const nested_ptr = try allocator.create(lark_document.LarkDocument);
+            nested_ptr.* = try lark_document.LarkDocument.deep_clone(allocator, nested);
+            node.nested = nested_ptr;
         }
         return node;
     }

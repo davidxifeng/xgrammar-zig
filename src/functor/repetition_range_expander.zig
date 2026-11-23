@@ -360,3 +360,11 @@ test "repetition range expander rejects invalid ranges" {
     defer gpa.free(msg);
     try std.testing.expectEqualStrings("Invalid repetition range {3, 1}", msg);
 }
+
+test "unbounded repetition above threshold does not crash (test_repetition_range.rs)" {
+    const gpa = std.testing.allocator;
+    const grammar = try @import("grammar_normalizer.zig").from_ebnf(gpa, "root ::= [a-z]{129,} [0-9]{129,}", "root", null);
+    defer grammar.deinit();
+    const expanded = try repetition_range_expander(gpa, grammar, null);
+    defer expanded.deinit();
+}

@@ -9,6 +9,7 @@ pub const grammar = @import("grammar/mod.zig");
 pub const parser = @import("parser/mod.zig");
 pub const fsm = @import("fsm/mod.zig");
 pub const functor = @import("functor/mod.zig");
+pub const converter = @import("converter/mod.zig");
 
 test {
     _ = config;
@@ -18,4 +19,5 @@ test {
     _ = parser;
     _ = fsm;
     _ = functor;
+    _ = converter;
 }

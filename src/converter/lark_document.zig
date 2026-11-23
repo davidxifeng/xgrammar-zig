@@ -14,6 +14,9 @@ const LarkNode = lark_node.LarkNode;
 /// from the document's own arena; `deinit` frees the whole document (Rust relies on drop).
 pub const LarkDocument = struct {
     arena: *std.heap.ArenaAllocator,
+    /// False for nested `%lark` documents whose arena lives inside the parent document's
+    /// arena: `deinit` must not tear the arena down (the parent reclaims it).
+    owned: bool = true,
     /// Rule and terminal definitions, in source order.
     definitions: std.ArrayList(LarkDefinition) = .empty,
     /// `%ignore` expressions.
@@ -30,10 +33,17 @@ pub const LarkDocument = struct {
     };
 
     /// An empty document owning a fresh arena under `backing`.
-    pub fn create(backing: std.mem.Allocator) std.mem.Allocator!LarkDocument {
+    pub fn create(backing: std.mem.Allocator) std.mem.Allocator.Error!LarkDocument {
         const arena = try backing.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(backing);
         return .{ .arena = arena };
+    }
+
+    /// A nested `%lark` document whose memory is reclaimed by the parent document's arena.
+    pub fn create_nested(parent_alloc: std.mem.Allocator) std.mem.Allocator.Error!LarkDocument {
+        var document = try create(parent_alloc);
+        document.owned = false;
+        return document;
     }
 
     /// The document's allocation context (also the JSON value tree's owner).
@@ -43,13 +53,14 @@ pub const LarkDocument = struct {
 
     /// Frees the document and every node, string, and JSON value in it.
     pub fn deinit(self: *LarkDocument) void {
+        if (!self.owned) return; // nested document: reclaimed by its parent's arena
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self.arena);
     }
 
     /// Deep copy under `backing` with a fresh arena (Rust `LarkDocument::clone`).
-    pub fn deep_clone(backing: std.mem.Allocator, other: *const LarkDocument) std.mem.Allocator!LarkDocument {
+    pub fn deep_clone(backing: std.mem.Allocator, other: *const LarkDocument) std.mem.Allocator.Error!LarkDocument {
         var document = try LarkDocument.create(backing);
         errdefer document.deinit();
         const a = document.allocator();
@@ -82,20 +93,21 @@ pub const LarkDocument = struct {
 
 /// Deep copy of a `std.json.Value` tree into `allocator` (the parse tree normally lives in
 /// the source document's arena).
-pub fn clone_json_value(allocator: std.mem.Allocator, value: std.json.Value) std.mem.Allocator!std.json.Value {
+pub fn clone_json_value(allocator: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     return switch (value) {
         .null, .bool, .integer, .float, .number_string => value,
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
         .array => |array| blk: {
-            var out = try allocator.alloc(std.json.Value, array.items.len);
-            for (array.items, 0..) |item, i| out[i] = try clone_json_value(allocator, item);
-            break :blk .{ .array = .{ .items = out } };
+            var out = std.json.Array.init(allocator);
+            try out.ensureTotalCapacity(array.items.len);
+            for (array.items) |item| out.appendAssumeCapacity(try clone_json_value(allocator, item));
+            break :blk .{ .array = out };
         },
         .object => |object| blk: {
-            var out = std.json.ObjectMap.init(allocator);
+            var out: std.json.ObjectMap = .empty;
             var it = object.iterator();
             while (it.next()) |entry| {
-                try out.put(try allocator.dupe(u8, entry.key_ptr.*), try clone_json_value(allocator, entry.value_ptr.*));
+                try out.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try clone_json_value(allocator, entry.value_ptr.*));
             }
             break :blk .{ .object = out };
         },

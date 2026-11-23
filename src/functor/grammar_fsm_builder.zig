@@ -310,7 +310,7 @@ pub const GrammarFsmBuilder = struct {
         grammar: *const Grammar,
         max_num_states: i32,
         err_msg: ?*?[]u8,
-    ) error{Flatten}!FsmWithStartEnd {
+    ) (Allocator.Error || error{Flatten})!FsmWithStartEnd {
         return regular_grammar_fsm_builder_mod.build(allocator, grammar, max_num_states, err_msg);
     }
 

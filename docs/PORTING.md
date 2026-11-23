@@ -249,3 +249,9 @@
    - functor 接线时发现的两处 const 修正(编译期阻塞,fsm 波代办,语义不变):
      grammar_fsm_builder.zig token_tag_dispatch 的 `ends` 与 regex 的 `built`/`simplified`
      需 `var`(errdefer deinit 要求可变指针)。
+
+7. **converter 波次(WaveConverter)**:
+   - 开发期 symlink(`src/converter/{config.zig,fsm,functor,grammar,parser,support}`)及根临时 scratch 文件(`src/converter_dev_test.zig`、`src/lark_check.zig`、`src/grammar_scratch_check.zig`)已删除,模块内 import 统一改为 `../` 前缀并接线至 `src/xgrammar.zig`。
+   - 补齐 4 个 XML converter 文件(`xml_converter.zig`、`xml_tool_calling_converter.zig`、`cohere_xml_tool_calling_converter.zig`、`minimax_m3_xml_tool_calling_converter.zig`)并在 `json_schema_converter.zig` 接通 `.MiniMaxM3Xml` / `.CohereXml` / `XmlToolCallingConverter`,`NotImplementedInWaveLark` 全数消除。
+   - 错误与诊断:Schema/Lark/StructuralTag/XML 等错误遵循 `error{...} + *ErrorInfo` 诊断出参约定;所有公开 `from_*` 返回由调用方负责 `deinit()` 的 `*Grammar`。
+   - `fsm/regex_ir.zig` 与 `functor/{grammar_fsm_builder,regular_grammar_fsm_builder,repetition_range_expander}.zig` 修复了 3 处中间缓冲/FSM 泄漏及重复区间优化回归,`std.testing.allocator` 下全波零泄漏(196 过 + 3 待后续波次解锁的 SkipZigTest)。

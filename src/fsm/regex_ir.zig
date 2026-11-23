@@ -403,6 +403,7 @@ pub const RegexIr = struct {
         if (branches.items.len == 1) {
             states = try allocator.alloc(RegexNode, branches.items[0].items.len);
             @memcpy(states, branches.items[0].items);
+            branches.items[0].deinit(allocator);
         } else {
             const union_nodes = try allocator.alloc(RegexNode, branches.items.len);
             for (branches.items, 0..) |branch, bi| {
@@ -453,9 +454,21 @@ pub const RegexIr = struct {
     fn visit(self: *const RegexIr, node: RegexNode, err_msg: ?*?[]u8) RegexError!FsmWithStartEnd {
         return switch (node) {
             .Leaf => |regex| self.build_leaf(regex, err_msg),
-            .Star => |child| (try self.visit(child.*, err_msg)).star(self.allocator),
-            .Plus => |child| (try self.visit(child.*, err_msg)).plus(self.allocator),
-            .Optional => |child| (try self.visit(child.*, err_msg)).optional(self.allocator),
+            .Star => |child| blk: {
+                var sub = try self.visit(child.*, err_msg);
+                defer sub.deinit();
+                break :blk try sub.star(self.allocator);
+            },
+            .Plus => |child| blk: {
+                var sub = try self.visit(child.*, err_msg);
+                defer sub.deinit();
+                break :blk try sub.plus(self.allocator);
+            },
+            .Optional => |child| blk: {
+                var sub = try self.visit(child.*, err_msg);
+                defer sub.deinit();
+                break :blk try sub.optional(self.allocator);
+            },
             .Union => |branches| blk: {
                 var fsms: std.ArrayList(FsmWithStartEnd) = .empty;
                 defer {
@@ -664,7 +677,7 @@ pub const RegexIr = struct {
         }
 
         var ranges: std.ArrayList(CodepointRange) = .empty;
-        errdefer ranges.deinit(a);
+        defer ranges.deinit(a);
         while (pos < content_end) {
             // One class unit: an escape sequence or a literal (possibly multi-byte) character.
             var unit: RegexEscape = undefined;

@@ -25,7 +25,7 @@
 ## Wave C(converter)
 | Rust 文件 | Zig 文件 | 状态 |
 |---|---|---|
-| converter/* (json_schema_converter 1114、schema_converter 1094、schema_parser 1014、lark_compiler 1358、structural_tag_*、xml_* 等) | src/converter/* | ☐ |
+| converter/* (json_schema_converter 1114、schema_converter 1094、schema_parser 1014、lark_compiler 1358、structural_tag_*、xml_* 等 19 文件) | src/converter/* (20 源文件 + spec_test/lark_spec_test) | 🔗 已接线(XML/Lark/StructuralTag 全补齐;NotImplementedInWaveLark 0 残留;196 过 + 3 门控,0 泄漏) |
 
 ## Wave D(compiler)
 | Rust 文件 | Zig 文件 | 状态 |

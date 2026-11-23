@@ -34,7 +34,7 @@ pub fn build(
     err_msg: ?*?[]u8,
 ) (Allocator.Error || error{Flatten})!FsmWithStartEnd {
     if (max_num_states < 2) {
-        set_msg(allocator, err_msg, "Regular grammar FSM state limit must be at least 2") catch return error.Flatten;
+        set_msg_z(allocator, err_msg, "Regular grammar FSM state limit must be at least 2") catch return error.Flatten;
         return error.Flatten;
     }
     var builder = Builder{
@@ -52,11 +52,12 @@ pub fn build(
         error.Flatten => return error.Flatten,
     };
     var ends: std.ArrayList(i32) = .empty;
-    defer ends.deinit(allocator);
+    errdefer ends.deinit(allocator);
     try ends.append(allocator, 1);
-    const result = try FsmWithStartEnd.new(allocator, builder.fsm, 0, ends, false);
-    builder.fsm = Fsm.empty(allocator); // moved into the result
-    const simplified = try result.simplify_epsilon(allocator);
+    var result = try FsmWithStartEnd.new(allocator, builder.fsm, 0, ends, false);
+    builder.fsm = try Fsm.empty(allocator); // moved into the result
+    defer result.deinit();
+    var simplified = try result.simplify_epsilon(allocator);
     defer simplified.deinit();
     return simplified.merge_equivalent_states(allocator);
 }

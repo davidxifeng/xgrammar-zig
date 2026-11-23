@@ -62,7 +62,7 @@ pub const LarkDefinition = struct {
     }
 
     /// Deep copy into `allocator` (Rust `Clone`).
-    pub fn clone(self: *const LarkDefinition, allocator: std.mem.Allocator) std.mem.Allocator!LarkDefinition {
+    pub fn clone(self: *const LarkDefinition, allocator: std.mem.Allocator) std.mem.Allocator.Error!LarkDefinition {
         var definition = LarkDefinition.new(try allocator.dupe(u8, self.name), self.is_terminal, try self.body.clone(allocator), self.location);
         definition.lazy = self.lazy;
         if (self.suffix) |suffix| definition.suffix = try suffix.clone(allocator);
