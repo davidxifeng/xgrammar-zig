@@ -262,3 +262,14 @@
    - `RuleLevelCache`(16 分片)与 `GrammarCompiler` 的 `CacheState` 使用 `std.atomic.Mutex` 自旋互斥(Zig 0.17 `std.Thread` 无无 `Io` 互斥锁)。
    - `TokenizerInfo` 增补 `clone()` 并使 `check_metadata_match` 支持 `*const TokenizerInfo` 且零分配;顺带修复 `parser/earley_parser.zig`(`init_fsm_state_offsets` 与 `per_rule_fsm` 悬垂栈引用等潜伏 bug)与 `functor/grammar_fsm_hasher.zig`(BFS 访问重入、`hash_and_target` 类型与 `StateIdMap` 传参)。
    - 序列化 JSON 键按字典序插入(`__VERSION__` < `adaptive_token_mask_cache` < `grammar` < `tokenizer_metadata`,`AdaptiveTokenMask` 内同排序),`build_adaptive_token_mask_cache` 在直译期保持串行并将 `reachable_states` 升序排列以保证确定性(多线程化保留到 Milestone 4)。
+
+## 9. Wave E 补充(`matcher`、`testing`、根 API 与 Oracle 比特级对拍)
+
+1. **`EarleyParser` 与 capture 状态深拷贝**:
+   - 为 `src/parser/earley_parser.zig` 补齐 `clone`、`free_capture_rows_from` 及推入/替换 capture 行时的独立深拷贝,并在 `deinit` / `pop_last_states` / `reset` 中精准释放,支撑 `GrammarMatcher.fork()`、`rollback()` 与 `find_jump_forward_string()` 零泄漏回溯。
+2. **`matcher/*` 与 `testing.zig` / `xgrammar.zig` 根重导出**:
+   - 完成 `error.zig`、`budget_body_match_progress.zig`、`capture_span_event.zig`、`token_bitmask.zig`、`grammar_matcher.zig`、`batch_grammar_matcher.zig` 及 `testing.zig` (`print_token_by_ids`、`print_grammar_fsms`、`is_rule_fsm_accept_string`)。
+   - 移除 `src/` 中全部残余 `error.SkipZigTest` 门控(`spec_test_regular_grammar_fsm.zig`、`lark_spec_test.zig` 等),恢复 `tests/rust_api.rs` 集成测试至 `src/tests.zig`。
+3. **Oracle CLI 与全量对拍 (`tools/oracle.zig`)**:
+   - 在 `build.zig` 中接入 `xgrammar-oracle` 可执行产物,完整对齐 `tools/oracle-rs/src/main.rs` JSON 输入输出协议(含多字位掩码、`json_schema`/`ebnf`、`byte_fallback`/`raw` 词表、`add_prefix_space`、`vocab_size` padding 与 Unicode `from_utf8_lossy` 最大子串替换)。
+   - `xgrammar-oracle` 与 Rust `oracle` 在 5 组跨场景全序列上达到 100% 一致;黄金用例已固化至 `src/oracle_parity_test.zig`。

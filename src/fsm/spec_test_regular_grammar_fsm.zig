@@ -49,9 +49,68 @@ test "test_recursive_callee_cannot_use_callers_optional_exit" {
     }
 }
 
-test "test_regex_fallback_matches_original_grammar_skipped_until_matcher" {
-    // Needs GrammarCompiler + GrammarMatcher (Wave D/E).
-    return error.SkipZigTest;
+test "test_regex_fallback_matches_original_grammar" {
+    const gpa = std.testing.allocator;
+    const tokenizer_mod = @import("../tokenizer/mod.zig");
+    const converter_mod = @import("../converter/mod.zig");
+    const functor_mod = @import("../functor/mod.zig");
+    const compiler_mod = @import("../compiler/mod.zig");
+    const matcher_mod = @import("../matcher/mod.zig");
+
+    var tok = try tokenizer_mod.TokenizerInfo.new(gpa, &.{}, .Raw, null, null, false, null);
+    defer tok.deinit();
+    const comp = try compiler_mod.GrammarCompiler.new(gpa, &tok, 1, false, -1);
+    defer comp.deinit();
+
+    const patterns = [_][]const u8{
+        "(ab|c){1,3}d?",
+        "(a*b)+c{2,}",
+        "(ab|){0,3}z",
+        "[é你]+|a\\s\\D",
+        "[^你]",
+        "^[a-zA-Z0-9\\.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+\\.[a-zA-Z]{2,}$",
+    };
+    const samples = [_][]const u8{
+        "",
+        "ab",
+        "abc",
+        "abccd",
+        "d",
+        "cccc",
+        "bcc",
+        "aabbccc",
+        "abcc",
+        "acccc",
+        "z",
+        "abz",
+        "ababz",
+        "abababz",
+        "ababababz",
+        "é你é",
+        "你",
+        "a b",
+        "a 1",
+        "a\tb",
+        "name@example.com",
+        "name@example",
+        "name@.com",
+        "<|close|>",
+    };
+    for (patterns) |pattern| {
+        const g = try converter_mod.from_regex(gpa, pattern, null);
+        defer g.deinit();
+        var fsm = try functor_mod.GrammarFsmBuilder.from_regular_grammar(gpa, g, MAX_NUM_STATES, null);
+        defer fsm.deinit();
+        var compiled = try comp.compile_grammar(g, null);
+        defer compiled.deinit();
+        var matcher = try matcher_mod.GrammarMatcher.from_compiled_grammar(gpa, &compiled, true);
+        defer matcher.deinit();
+        for (samples) |sample| {
+            try matcher.reset();
+            const expected = (try matcher.accept_string(sample)) and matcher.is_terminated();
+            try std.testing.expectEqual(expected, try fsm.accept_string(sample));
+        }
+    }
 }
 
 test "test_rejects_unsupported_recursion_and_bounds" {

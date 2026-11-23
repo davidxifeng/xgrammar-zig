@@ -246,11 +246,7 @@ test "dynamic tool call lowers to tag dispatch" {
 
 test "numeric and named special tokens" {
     const vocab = [_][]const u8{ "a", "<|tool|>", "b" };
-    var tokenizer_diag: tokenizer_mod.error_mod.TokenizerErrorInfo = undefined;
-    var tokenizer_info = tokenizer_mod.tokenizer_info.TokenizerInfo.new(allocator, &vocab, .Raw, 3, &.{}, false, &tokenizer_diag) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.SkipZigTest,
-    };
+    var tokenizer_info = try tokenizer_mod.tokenizer_info.TokenizerInfo.new(allocator, &vocab, .Raw, 3, &.{}, false, null);
     defer tokenizer_info.deinit();
     const grammar = try lark_converter.from_lark(allocator, "start: <[0,2]> | <|tool|>", &tokenizer_info, &.{}, null);
     defer grammar.deinit();

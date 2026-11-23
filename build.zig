@@ -15,4 +15,16 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit + parity tests");
     test_step.dependOn(&run_tests.step);
+
+    const oracle_mod = b.createModule(.{
+        .root_source_file = b.path("tools/oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oracle_mod.addImport("xgrammar", mod);
+    const oracle_exe = b.addExecutable(.{
+        .name = "xgrammar-oracle",
+        .root_module = oracle_mod,
+    });
+    b.installArtifact(oracle_exe);
 }

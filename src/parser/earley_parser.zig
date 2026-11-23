@@ -204,9 +204,116 @@ pub const EarleyParser = struct {
         return parser;
     }
 
+    fn free_capture_rows_from(self: *EarleyParser, first_row: usize) void {
+        if (!self.capture_tracking) return;
+        var r = first_row;
+        while (r < self.capture_event_history.len()) : (r += 1) {
+            for (self.capture_event_history.row_mut(r)) |*ev| {
+                ev.stop_capture_targets.deinit(self.gpa);
+            }
+        }
+    }
+
+    /// Deep-clones the parser state into a new heap-allocated `EarleyParser` borrowing the
+    /// same `grammar`.
+    pub fn clone(self: *const EarleyParser, gpa: Allocator) EarleyError!*EarleyParser {
+        const rule_is_nullable = try gpa.dupe(bool, self.rule_is_nullable);
+        errdefer gpa.free(rule_is_nullable);
+
+        var is_completed: ArrayList(bool) = .empty;
+        errdefer is_completed.deinit(gpa);
+        try is_completed.appendSlice(gpa, self.is_completed.items);
+
+        var completable = try Compact2dArray(CompletableState).init_from_data_and_indptr(
+            gpa,
+            self.rule_id_to_completable_states.data_slice(),
+            self.rule_id_to_completable_states.indptr_slice(),
+        );
+        errdefer completable.deinit();
+
+        var scanable = try Compact2dArray(ParserState).init_from_data_and_indptr(
+            gpa,
+            self.scanable_state_history.data_slice(),
+            self.scanable_state_history.indptr_slice(),
+        );
+        errdefer scanable.deinit();
+
+        var flags_cache: ArrayList(u64) = .empty;
+        errdefer flags_cache.deinit(gpa);
+        try flags_cache.appendSlice(gpa, self.fsm_state_flags_cache.items);
+
+        var state_offsets: ArrayList(usize) = .empty;
+        errdefer state_offsets.deinit(gpa);
+        try state_offsets.appendSlice(gpa, self.fsm_state_offsets.items);
+
+        var char_counts: ArrayList(i32) = .empty;
+        errdefer char_counts.deinit(gpa);
+        try char_counts.appendSlice(gpa, self.char_count_history.items);
+
+        var char_entries: ArrayList(bool) = .empty;
+        errdefer char_entries.deinit(gpa);
+        try char_entries.appendSlice(gpa, self.char_budget_entry_history.items);
+
+        const src_captures = self.capture_event_history.data_slice();
+        const cloned_captures_buf = try gpa.alloc(CaptureEvent, src_captures.len);
+        defer gpa.free(cloned_captures_buf);
+        var cloned_count: usize = 0;
+        errdefer for (cloned_captures_buf[0..cloned_count]) |*ev| ev.stop_capture_targets.deinit(gpa);
+        for (src_captures, 0..) |ev, i| {
+            cloned_captures_buf[i] = try capture_event_mod.clone(ev, gpa);
+            cloned_count += 1;
+        }
+        var capture_history = try Compact2dArray(CaptureEvent).init_from_data_and_indptr(
+            gpa,
+            cloned_captures_buf,
+            self.capture_event_history.indptr_slice(),
+        );
+        // After `init_from_data_and_indptr` succeeds, ownership of each element's
+        // `stop_capture_targets` moves into `capture_history`.
+        cloned_count = 0;
+        errdefer {
+            var r: usize = 0;
+            while (r < capture_history.len()) : (r += 1) {
+                for (capture_history.row_mut(r)) |*ev| ev.stop_capture_targets.deinit(gpa);
+            }
+            capture_history.deinit();
+        }
+
+        const copy = try gpa.create(EarleyParser);
+        copy.* = .{
+            .gpa = gpa,
+            .grammar = self.grammar,
+            .tmp_accept_stop_token = self.tmp_accept_stop_token,
+            .is_completed = is_completed,
+            .rule_id_to_completable_states = completable,
+            .scanable_state_history = scanable,
+            .tmp_states_to_be_added = .empty,
+            .tmp_process_state_queue = .empty,
+            .tmp_states_visited_in_queue = RepeatDetector.new(),
+            .stop_token_is_accepted = self.stop_token_is_accepted,
+            .fsm_state_flags_cache = flags_cache,
+            .fsm_state_offsets = state_offsets,
+            .rule_is_nullable = rule_is_nullable,
+            .current_token_index = self.current_token_index,
+            .skip_expired_states = self.skip_expired_states,
+            .has_budget_rules = self.has_budget_rules,
+            .char_count_history = char_counts,
+            .has_char_budget_rules = self.has_char_budget_rules,
+            .char_budget_entry_history = char_entries,
+            .tmp_char_budget_entered = self.tmp_char_budget_entered,
+            .capture_tracking = self.capture_tracking,
+            .has_hidden_capture_rules = self.has_hidden_capture_rules,
+            .capture_recording = self.capture_recording,
+            .capture_event_history = capture_history,
+            .tmp_completed_lazy_occurrences = .empty,
+        };
+        return copy;
+    }
+
     /// Releases everything the parser owns, including itself.
     pub fn deinit(self: *EarleyParser) void {
         const gpa = self.gpa;
+        self.free_capture_rows_from(0);
         self.is_completed.deinit(gpa);
         self.rule_id_to_completable_states.deinit();
         self.scanable_state_history.deinit();
@@ -422,6 +529,8 @@ pub const EarleyParser = struct {
         self.is_completed.shrinkRetainingCapacity(self.is_completed.items.len - n);
         self.scanable_state_history.pop_back(n);
         if (self.capture_tracking) {
+            const len = self.capture_event_history.len();
+            self.free_capture_rows_from(len - n);
             self.capture_event_history.pop_back(n);
         }
         if (self.has_char_budget_rules) {
@@ -728,6 +837,7 @@ pub const EarleyParser = struct {
         self.is_completed.clearRetainingCapacity();
         self.stop_token_is_accepted = false;
         if (self.capture_tracking) {
+            self.free_capture_rows_from(0);
             const rows3 = self.capture_event_history.len();
             self.capture_event_history.pop_back(rows3);
         }
@@ -1152,12 +1262,20 @@ pub const EarleyParser = struct {
         return out;
     }
 
-    /// Pushes a new row of capture events, keeping the capture history aligned with the state
-    /// history when a position is created outside of `advance`.
+    /// Pushes a new row of capture events (deep-cloning into `self.gpa`), keeping the
+    /// capture history aligned with the state history when a position is created outside `advance`.
     pub fn push_capture_row(self: *EarleyParser, events: []const CaptureEvent) Allocator.Error!void {
-        if (self.capture_tracking) {
-            _ = try self.capture_event_history.push_row(events);
+        if (!self.capture_tracking) return;
+        const cloned = try self.gpa.alloc(CaptureEvent, events.len);
+        defer self.gpa.free(cloned);
+        var initialized: usize = 0;
+        errdefer for (cloned[0..initialized]) |*ev| ev.stop_capture_targets.deinit(self.gpa);
+        for (events, 0..) |ev, i| {
+            cloned[i] = try capture_event_mod.clone(ev, self.gpa);
+            initialized += 1;
         }
+        _ = try self.capture_event_history.push_row(cloned);
+        initialized = 0;
     }
 
     /// A copy of the latest history row (deep; caller owns, see [`ParserRow.deinit`]).
@@ -1171,8 +1289,8 @@ pub const EarleyParser = struct {
         return row;
     }
 
-    /// Replaces the latest history row (used to restore a row after a failed tentative
-    /// transition, or to commit an enforced one).
+    /// Replaces the latest history row (deep-cloning capture events into `self.gpa`;
+    /// used to restore a row after a failed tentative transition, or to commit an enforced one).
     pub fn replace_latest_row(self: *EarleyParser, row: ParserRow) Allocator.Error!void {
         self.scanable_state_history.pop_back(1);
         _ = try self.scanable_state_history.push_row(row.states.items);
@@ -1180,8 +1298,10 @@ pub const EarleyParser = struct {
         _ = try self.rule_id_to_completable_states.push_row(row.completable_states.items);
         self.is_completed.items[self.is_completed.items.len - 1] = row.completed;
         if (self.capture_tracking) {
+            const len = self.capture_event_history.len();
+            self.free_capture_rows_from(len - 1);
             self.capture_event_history.pop_back(1);
-            _ = try self.capture_event_history.push_row(row.capture_events.items);
+            try self.push_capture_row(row.capture_events.items);
         }
     }
 

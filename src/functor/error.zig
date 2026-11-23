@@ -15,9 +15,6 @@ pub const FunctorError = Allocator.Error || @import("../support/mod.zig").Compac
     LazyRuleBodyNotChoices,
     /// A lazy rule whose body contains an element that does not compile into the rule's own FSM.
     LazyRuleElementNotTerminal,
-    /// A grammar fsm-storage member awaited from the grammar wave (PORTING deviation 4:
-    /// `complete_fsm`/`per_rule_fsms`/`set_fsms` are not installed yet).
-    NotImplementedInWaveGrammar,
 };
 
 /// The diagnostic payload of a `FunctorError` (Rust enum data; strings are borrowed

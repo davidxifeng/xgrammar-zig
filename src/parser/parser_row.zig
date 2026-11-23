@@ -63,7 +63,7 @@ pub const ParserRow = struct {
     pub fn deinit(self: *ParserRow, gpa: std.mem.Allocator) void {
         self.states.deinit(gpa);
         self.completable_states.deinit(gpa);
-        for (self.capture_events.items) |*event| event.deinit(gpa);
+        for (self.capture_events.items) |*event| capture_event.deinit(event, gpa);
         self.capture_events.deinit(gpa);
     }
 };

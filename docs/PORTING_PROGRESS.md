@@ -35,6 +35,6 @@
 ## Wave E(matcher + API + parity)
 | Rust 文件 | Zig 文件 | 状态 |
 |---|---|---|
-| matcher/* (grammar_matcher 1911、token_bitmask 214、batch_grammar_matcher 144 等) | src/matcher/* | ☐ |
-| testing.rs / config.rs / lib.rs re-export 面 | src/testing.zig / src/config.zig / src/xgrammar.zig | ☐ |
-| oracle 全量对拍(JSON schema × byte_level 词表 × 中文) | tools/ | ☐ |
+| matcher/* (grammar_matcher 1911、token_bitmask 214、batch_grammar_matcher 144 等) | src/matcher/* (7 文件) | 🔗 已接线(218 过, 0 跳过, 0 泄漏) |
+| testing.rs / config.rs / lib.rs re-export 面 | src/testing.zig / src/config.zig / src/xgrammar.zig / src/tests.zig / src/oracle_parity_test.zig | 🔗 已接线 |
+| oracle 全量对拍(JSON schema × byte_fallback/raw 词表 × 中文 × 多字位掩码) | tools/oracle.zig + build.zig (`xgrammar-oracle`) | 🔗 已接线(与 `tools/oracle-rs` 100% 比特级一致) |
