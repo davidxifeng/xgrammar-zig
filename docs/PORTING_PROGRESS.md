@@ -6,7 +6,7 @@
 | Rust 文件 | Zig 文件 | 状态 |
 |---|---|---|
 | support/* (10 文件,1434 行) | src/support/* | ✅(36 测试绿,集成者复核) |
-| grammar/* (13 文件,2160 行) | src/grammar/* | ✅(59 测试绿,集成者复核;fsm 相关入口挂 `error.NotImplementedInWaveFsm`,Wave E 前由 WaveGrammar 补齐) |
+| grammar/* (13 文件,2160 行) | src/grammar/* | 🔗 已接线+fsm 挂点补齐(NotImplementedInWaveFsm 0 残留;test_serialization.rs 8 测试已移植;set_fsms retain 偏离已登记) |
 | config.rs (12) | src/config.zig | ✅(集成者建,WaveGrammar 同译校对) |
 | tokenizer/vocab_type.rs (56) | src/tokenizer/vocab_type.zig | ✅ |
 | tokenizer/error.rs (17) | src/tokenizer/error.zig | ✅ |

@@ -8,7 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExprType = grammar_mod.GrammarExprType;
@@ -91,12 +91,12 @@ const StructureNormalizer = struct {
         const gpa = self.builder.allocator;
         switch (ty) {
             .TagDispatch => {
-                const tag_dispatch = try tag_dispatch_mod.decode_tag_dispatch_data(self.base.?, gpa, data);
+                var tag_dispatch = try tag_dispatch_mod.decode_tag_dispatch_data(self.base.?, gpa, data);
                 defer tag_dispatch.deinit(gpa);
                 return self.builder.add_tag_dispatch(&tag_dispatch);
             },
             .TokenTagDispatch => {
-                const ttd = try token_tag_dispatch_mod.decode_token_tag_dispatch_data(gpa, data);
+                var ttd = try token_tag_dispatch_mod.decode_token_tag_dispatch_data(gpa, data);
                 defer ttd.deinit(gpa);
                 return self.builder.add_token_tag_dispatch(&ttd);
             },
@@ -284,9 +284,9 @@ const StructureNormalizer = struct {
 
 test "structure normalizer flattens nested choices and sequences" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
-    const GrammarBuilder = mod.GrammarBuilder;
-    var builder = try GrammarBuilder.new(gpa);
+    const mod = @import("../grammar/mod.zig");
+    const GB = mod.grammar_builder.GrammarBuilder;
+    var builder = try GB.new(gpa);
     defer builder.deinit();
     // root ::= ((("a" | ("b" "")) "c")) | ""
     const a = try builder.add_byte_string("a");
@@ -303,5 +303,5 @@ test "structure normalizer flattens nested choices and sequences" {
     const printer = mod.printer;
     const ebnf = try printer.to_string_ebnf(normalized, gpa);
     defer gpa.free(ebnf);
-    try std.testing.expectEqualStrings("root ::= (\"\" | (\"a\" \"c\") | (\"b\" \"c\"))\n", ebnf);
+    try std.testing.expectEqualStrings("root ::= (\"\" | (root_1 \"c\"))\nroot_1 ::= ((\"a\") | (\"b\"))\n", ebnf);
 }

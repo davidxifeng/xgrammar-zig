@@ -10,7 +10,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExprType = grammar_mod.GrammarExprType;
@@ -19,7 +19,15 @@ const NO_EXPR = grammar_mod.NO_EXPR;
 /// Rewrites every rule body and lookahead assertion of `grammar` in place with
 /// `rewriter`'s `visit_sequence`/`visit_choices` overrides (the Rust trait default
 /// `InPlaceGrammarRewriter::apply`).
-pub fn apply(rewriter: anytype, grammar: *Grammar) Allocator.Error!void {
+/// The struct type behind a pass value/pointer (dispatchers accept either form).
+fn PassT(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.child,
+        else => T,
+    };
+}
+
+pub fn apply(rewriter: anytype, grammar: *Grammar) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!void {
     var builder = try GrammarBuilder.edit_in_place(grammar);
     defer builder.deinit();
     try rewrite_all(rewriter, &builder);
@@ -28,7 +36,7 @@ pub fn apply(rewriter: anytype, grammar: *Grammar) Allocator.Error!void {
 
 /// The Rust closure body of `apply`, factored out so `grammar_fsm_builder` can run the
 /// same walk over an `edit_in_place` builder without committing.
-pub fn rewrite_all(rewriter: anytype, builder: *GrammarBuilder) Allocator.Error!void {
+pub fn rewrite_all(rewriter: anytype, builder: *GrammarBuilder) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!void {
     const gpa = builder.allocator;
     // Expr ids are dense, so the memo is a plain array over the original exprs. Appended
     // exprs are never visited again, so they need no memo slots.
@@ -53,7 +61,7 @@ pub fn rewrite_all(rewriter: anytype, builder: *GrammarBuilder) Allocator.Error!
 
 /// Visits an original expr, returning its rewritten id, or the original id when nothing
 /// changed. `memo` maps each original expr id to its result (`NO_EXPR` while unvisited).
-pub fn visit_expr(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr_id: i32) Allocator.Error!i32 {
+pub fn visit_expr(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr_id: i32) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!i32 {
     if (memo[@intCast(expr_id)] != NO_EXPR) {
         return memo[@intCast(expr_id)];
     }
@@ -68,12 +76,13 @@ pub fn visit_expr(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr
 
 /// Rebuilds a sequence when any element changed (the Rust trait default; the `@hasDecl`
 /// dispatch mirrors trait-method overriding).
-pub fn visit_sequence(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr_id: i32) Allocator.Error!i32 {
-    const M = PassT(rewriter);
+pub fn visit_sequence(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr_id: i32) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!i32 {
+    const M = PassT(@TypeOf(rewriter));
     if (comptime @hasDecl(M, "visit_sequence")) {
         return rewriter.visit_sequence(builder, memo, expr_id);
     }
-    if (try visit_children(rewriter, builder, memo, expr_id)) |new_element_ids| {
+    if (try visit_children(rewriter, builder, memo, expr_id)) |new_element_ids_const| {
+        var new_element_ids = new_element_ids_const;
         defer new_element_ids.deinit(builder.allocator);
         return builder.add_sequence(new_element_ids.items);
     }
@@ -81,12 +90,13 @@ pub fn visit_sequence(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, 
 }
 
 /// Rebuilds a choices when any choice changed (the Rust trait default).
-pub fn visit_choices(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr_id: i32) Allocator.Error!i32 {
-    const M = PassT(rewriter);
+pub fn visit_choices(rewriter: anytype, builder: *GrammarBuilder, memo: []i32, expr_id: i32) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!i32 {
+    const M = PassT(@TypeOf(rewriter));
     if (comptime @hasDecl(M, "visit_choices")) {
         return rewriter.visit_choices(builder, memo, expr_id);
     }
-    if (try visit_children(rewriter, builder, memo, expr_id)) |new_choice_ids| {
+    if (try visit_children(rewriter, builder, memo, expr_id)) |new_choice_ids_const| {
+        var new_choice_ids = new_choice_ids_const;
         defer new_choice_ids.deinit(builder.allocator);
         return builder.add_choices(new_choice_ids.items);
     }
@@ -100,7 +110,7 @@ pub fn visit_children(
     builder: *GrammarBuilder,
     memo: []i32,
     expr_id: i32,
-) Allocator.Error!?std.ArrayList(i32) {
+) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!?std.ArrayList(i32) {
     const size = builder.grammar_expr(expr_id).len();
     const gpa = builder.allocator;
     var new_child_ids: ?std.ArrayList(i32) = null;

@@ -7,7 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
 const NO_EXPR = grammar_mod.NO_EXPR;
@@ -97,7 +97,7 @@ const LookaheadAssertionAnalyzer = struct {
             const body = self.base.expr(self.base.rule(@intCast(i)).body_expr_id);
             switch (body.ty) {
                 .TagDispatch => {
-                    const td = try grammar_mod.tag_dispatch.tag_dispatch(self.base, self.allocator, self.base.rule(@intCast(i)).body_expr_id);
+                    var td = try grammar_mod.tag_dispatch.tag_dispatch(self.base, self.allocator, self.base.rule(@intCast(i)).body_expr_id);
                     defer td.deinit(self.allocator);
                     for (td.tag_rule_pairs.items) |pair| {
                         self.infos.items[@intCast(pair.rule_id)].is_triggered_by_dispatch = true;
@@ -105,7 +105,7 @@ const LookaheadAssertionAnalyzer = struct {
                     continue;
                 },
                 .TokenTagDispatch => {
-                    const ttd = try grammar_mod.token_tag_dispatch.token_tag_dispatch(self.base, self.allocator, self.base.rule(@intCast(i)).body_expr_id);
+                    var ttd = try grammar_mod.token_tag_dispatch.token_tag_dispatch(self.base, self.allocator, self.base.rule(@intCast(i)).body_expr_id);
                     defer ttd.deinit(self.allocator);
                     for (ttd.trigger_rule_pairs.items) |pair| {
                         self.infos.items[@intCast(pair.rule_id)].is_triggered_by_dispatch = true;
@@ -141,15 +141,15 @@ const LookaheadAssertionAnalyzer = struct {
 
 test "lookahead analyzer attaches the suffix after a single non-last reference" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
+    const mod = @import("../grammar/mod.zig");
     const GrammarBuilder = mod.GrammarBuilder;
     var builder = try GrammarBuilder.new(gpa);
     defer builder.deinit();
-    // part ::= "a"; root ::= part "b"
-    const part = try builder.add_rule_named("part", try builder.add_byte_string("a"));
+    // part ::= (("a")); root ::= ((part "b")) — normalized shape.
+    const part = try builder.add_rule_named("part", try builder.add_choices(&.{try builder.add_sequence(&.{try builder.add_byte_string("a")})}));
     _ = try builder.add_rule_named(
         "root",
-        try builder.add_sequence(&.{ try builder.add_rule_ref(part), try builder.add_byte_string("b") }),
+        try builder.add_choices(&.{try builder.add_sequence(&.{ try builder.add_rule_ref(part), try builder.add_byte_string("b") })}),
     );
     const grammar = try builder.into_grammar(gpa, "root", null);
     defer grammar.deinit();

@@ -8,7 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
 const in_place = @import("in_place_grammar_rewriter.zig");
@@ -19,7 +19,7 @@ const ByteStringFuser = struct {
         builder: *grammar_mod.GrammarBuilder,
         memo: []i32,
         expr_id: i32,
-    ) Allocator.Error!i32 {
+    ) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!i32 {
         _ = self;
         _ = memo;
         const gpa = builder.allocator;
@@ -70,7 +70,7 @@ const ByteStringFuser = struct {
 };
 
 /// Fuses adjacent byte strings in `grammar` in place (the `GrammarFunctor.byte_string_fuser` pass).
-pub fn byte_string_fuser(grammar: *Grammar) Allocator.Error!void {
+pub fn byte_string_fuser(grammar: *Grammar) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!void {
     try in_place.apply(ByteStringFuser{}, grammar);
 }
 

@@ -5,7 +5,7 @@
 //! `allow_empty_rule_ids` has populated the grammar.
 
 const std = @import("std");
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
 
@@ -18,7 +18,11 @@ pub fn repetition_normalizer(grammar: *Grammar) void {
         const repeat_rule_id = expr.data[0];
         grammar.rule_mut(repeat_rule_id).is_exact_lookahead = true;
         // allow_empty_rule_ids is kept sorted: a binary search is valid.
-        if (std.sort.binarySearch(i32, allow_empty, repeat_rule_id, std.sort.asc(i32)) != null) {
+        if (std.sort.binarySearch(i32, allow_empty, repeat_rule_id, struct {
+            fn cmp(ctx: i32, item: i32) std.math.Order {
+                return std.math.order(item, ctx);
+            }
+        }.cmp) != null) {
             // The repeated rule is nullable: set its minimum count to 0.
             grammar.set_expr_data(@intCast(expr_id), 1, 0);
         }
@@ -27,7 +31,7 @@ pub fn repetition_normalizer(grammar: *Grammar) void {
 
 test "repetition normalizer lowers the minimum of nullable repeats" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
+    const mod = @import("../grammar/mod.zig");
     const GrammarBuilder = mod.GrammarBuilder;
     var builder = try GrammarBuilder.new(gpa);
     defer builder.deinit();
@@ -42,9 +46,9 @@ test "repetition normalizer lowers the minimum of nullable repeats" {
     defer grammar.deinit();
 
     // The analyzer (under test in its own file) would mark `inner` empty; feed it directly.
-    try grammar.set_allow_empty_rule_ids(&.{1});
+    try grammar.set_allow_empty_rule_ids(&.{0});
     repetition_normalizer(grammar);
-    try std.testing.expect(grammar.rule(1).is_exact_lookahead);
-    const rep_expr = grammar.expr(grammar.rule(0).body_expr_id);
+    try std.testing.expect(grammar.rule(0).is_exact_lookahead);
+    const rep_expr = grammar.expr(grammar.rule(1).body_expr_id);
     try std.testing.expectEqual(@as(i32, 0), rep_expr.data[1]);
 }

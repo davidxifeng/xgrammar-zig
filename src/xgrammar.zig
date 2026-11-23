@@ -8,6 +8,7 @@ pub const tokenizer = @import("tokenizer/mod.zig");
 pub const grammar = @import("grammar/mod.zig");
 pub const parser = @import("parser/mod.zig");
 pub const fsm = @import("fsm/mod.zig");
+pub const functor = @import("functor/mod.zig");
 
 test {
     _ = config;
@@ -16,4 +17,5 @@ test {
     _ = grammar;
     _ = parser;
     _ = fsm;
+    _ = functor;
 }

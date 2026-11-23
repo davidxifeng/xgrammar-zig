@@ -5,12 +5,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
 const mutator = @import("mutator.zig");
 const MutatorState = mutator.MutatorState;
-const support = @import("support/mod.zig");
+const support = @import("../support/mod.zig");
 const error_mod = @import("error.zig");
 const FunctorError = error_mod.FunctorError;
 
@@ -19,7 +19,6 @@ const FunctorError = error_mod.FunctorError;
 pub const SingleElementExprEliminator = struct {
     /// Rebuilds a sequence; a one-element sequence collapses to its single child.
     pub fn visit_sequence(self: SingleElementExprEliminator, state: *MutatorState, data: []const i32) FunctorError!i32 {
-        _ = self;
         const gpa = state.gpa();
         var ids: std.ArrayList(i32) = .empty;
         defer ids.deinit(gpa);
@@ -31,7 +30,6 @@ pub const SingleElementExprEliminator = struct {
 
     /// Rebuilds an alternation; a one-element alternation collapses to its single child.
     pub fn visit_choices(self: SingleElementExprEliminator, state: *MutatorState, data: []const i32) FunctorError!i32 {
-        _ = self;
         const gpa = state.gpa();
         var ids: std.ArrayList(i32) = .empty;
         defer ids.deinit(gpa);

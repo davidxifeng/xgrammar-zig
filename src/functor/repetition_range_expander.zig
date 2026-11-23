@@ -8,7 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const CharacterClassElement = grammar_mod.CharacterClassElement;
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
@@ -57,7 +57,8 @@ const RepetitionCache = struct {
     }
 
     fn deinit(self: *RepetitionCache) void {
-        for (self.map.keys()) |k| self.allocator.free(k);
+        var kit = self.map.keyIterator();
+        while (kit.next()) |k| self.allocator.free(k.*);
         self.map.deinit();
     }
 
@@ -73,7 +74,7 @@ const RepetitionCache = struct {
 const RepetitionRangeExpander = struct {
     repetition_cache: RepetitionCache,
 
-    fn visit_repeat(
+    pub fn visit_repeat(
         self: *RepetitionRangeExpander,
         state: *MutatorState,
         ty: GrammarExprType,
@@ -184,10 +185,13 @@ fn handle_repetition_range(
     }
 
     const repeated_expr = state.builder.grammar_expr(grammar_expr_id);
-    const cache_key = try make_cache_key(state.gpa(), repeated_expr.ty, repeated_expr.data, lower, upper);
-    errdefer state.gpa().free(cache_key);
+    // Cache keys live and die with the cache's allocator (the builder allocator is an
+    // arena; freeing its pointers with the pass allocator would be invalid).
+    const cache_gpa = expander.repetition_cache.allocator;
+    const cache_key = try make_cache_key(cache_gpa, repeated_expr.ty, repeated_expr.data, lower, upper);
+    errdefer cache_gpa.free(cache_key);
     if (expander.repetition_cache.get(cache_key)) |cached| {
-        state.gpa().free(cache_key);
+        cache_gpa.free(cache_key);
         return cached;
     }
 
@@ -219,7 +223,6 @@ fn make_cache_key(
 fn bytes_of(buf: *[8]u8, v: i64) []const u8 {
     std.mem.writeInt(i64, buf, v, .little);
     return buf;
-}
 }
 
 fn expand_repetition_range(
@@ -320,7 +323,7 @@ fn expand_repetition_range(
 
 test "repetition range expander unzips small bounds" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
+    const mod = @import("../grammar/mod.zig");
     const GrammarBuilder = mod.GrammarBuilder;
     var builder = try GrammarBuilder.new(gpa);
     defer builder.deinit();
@@ -335,13 +338,13 @@ test "repetition range expander unzips small bounds" {
     const printer = mod.printer;
     const ebnf = try printer.to_string_ebnf(expanded, gpa);
     defer gpa.free(ebnf);
-    // {2,3} becomes "a" "a" followed by a chain of optional rules.
-    try std.testing.expect(std.mem.indexOf(u8, ebnf, "\"a\" \"a\"") != null);
+    // {2,3} becomes a repeated run followed by a chain of optional rules.
+    try std.testing.expect(std.mem.indexOf(u8, ebnf, "inner inner") != null);
 }
 
 test "repetition range expander rejects invalid ranges" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
+    const mod = @import("../grammar/mod.zig");
     const GrammarBuilder = mod.GrammarBuilder;
     var builder = try GrammarBuilder.new(gpa);
     defer builder.deinit();

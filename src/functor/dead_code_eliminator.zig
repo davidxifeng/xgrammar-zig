@@ -3,7 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
 const NO_EXPR = grammar_mod.NO_EXPR;
@@ -29,7 +29,7 @@ pub fn dead_code_eliminator(allocator: Allocator, grammar: *const Grammar) Funct
     // Recreate the surviving rules (in ascending old-id order), recording old → new ids.
     for (used) |old_id| {
         const new_id = try state.builder.add_empty_rule(grammar.rule(old_id).name);
-        try pass.rule_id_map.put(gpa, old_id, new_id);
+        try pass.rule_id_map.put(old_id, new_id);
     }
     for (used) |old_id| {
         const rule = grammar.rule(old_id);
@@ -75,7 +75,7 @@ fn copy_attributes_remapped(
 const DeadCodeEliminator = struct {
     rule_id_map: std.AutoHashMap(i32, i32),
 
-    fn visit_rule_ref(
+    pub fn visit_rule_ref(
         self: *DeadCodeEliminator,
         state: *MutatorState,
         ty: GrammarExprType,
@@ -86,7 +86,7 @@ const DeadCodeEliminator = struct {
         return state.builder.add_rule_ref(new_id);
     }
 
-    fn visit_repeat(
+    pub fn visit_repeat(
         self: *DeadCodeEliminator,
         state: *MutatorState,
         ty: GrammarExprType,
@@ -98,7 +98,7 @@ const DeadCodeEliminator = struct {
     }
 
     /// Tag-dispatch payloads embed rule ids, which the rule remapping must also follow.
-    fn visit_tag_dispatch(
+    pub fn visit_tag_dispatch(
         self: *DeadCodeEliminator,
         state: *MutatorState,
         ty: GrammarExprType,
@@ -114,7 +114,7 @@ const DeadCodeEliminator = struct {
         return state.builder.add_tag_dispatch(&td);
     }
 
-    fn visit_token_tag_dispatch(
+    pub fn visit_token_tag_dispatch(
         self: *DeadCodeEliminator,
         state: *MutatorState,
         ty: GrammarExprType,
@@ -134,12 +134,12 @@ const DeadCodeEliminator = struct {
 /// Returns, in ascending order, the ids of all rules reachable from the root, counting the
 /// helper rules of suffix/stop metadata as referenced. Allocated from `allocator`.
 fn used_rules(allocator: Allocator, grammar: *const Grammar) Allocator.Error![]i32 {
-    var visited = std.AutoArrayHashMap(i32, void).init(allocator);
+    var visited = std.AutoHashMap(i32, void).init(allocator);
     defer visited.deinit();
-    var queue = std.Deque(i32).init(allocator);
-    defer queue.deinit();
-    try queue.push_back(grammar.root_rule_id);
-    while (queue.pop_front()) |rule_id| {
+    var queue: std.Deque(i32) = .empty;
+    defer queue.deinit(allocator);
+    try queue.pushBack(allocator, grammar.root_rule_id);
+    while (queue.popFront()) |rule_id| {
         const gop = try visited.getOrPut(rule_id);
         if (gop.found_existing) continue;
         const rule = grammar.rule(rule_id);
@@ -149,12 +149,15 @@ fn used_rules(allocator: Allocator, grammar: *const Grammar) Allocator.Error![]i
         }
         if (grammar.suffix_stop_info(rule_id)) |info| {
             if (info.body_rule_id != -1) {
-                try queue.push_back(info.body_rule_id);
-                try queue.push_back(info.marker_rule_id);
+                try queue.pushBack(allocator, info.body_rule_id);
+                try queue.pushBack(allocator, info.marker_rule_id);
             }
         }
     }
-    const result = try allocator.dupe(i32, visited.keys());
+    const result = try allocator.alloc(i32, visited.count());
+    var wi: usize = 0;
+    var kit = visited.keyIterator();
+    while (kit.next()) |k| { result[wi] = k.*; wi += 1; }
     std.mem.sort(i32, result, {}, std.sort.asc(i32));
     return result;
 }
@@ -168,19 +171,19 @@ fn collect_rule_refs(
 ) Allocator.Error!void {
     const expr = grammar.expr(expr_id);
     switch (expr.ty) {
-        .RuleRef, .Repeat => try queue.push_back(expr.data[0]),
+        .RuleRef, .Repeat => try queue.pushBack(allocator, expr.data[0]),
         .Sequence, .Choices => {
             for (expr.data) |child| try collect_rule_refs(allocator, grammar, child, queue);
         },
         .TagDispatch => {
-            const td = try grammar_mod.tag_dispatch.tag_dispatch(grammar, allocator, expr_id);
+            var td = try grammar_mod.tag_dispatch.tag_dispatch(grammar, allocator, expr_id);
             defer td.deinit(allocator);
-            for (td.tag_rule_pairs.items) |pair| try queue.push_back(pair.rule_id);
+            for (td.tag_rule_pairs.items) |pair| try queue.pushBack(allocator, pair.rule_id);
         },
         .TokenTagDispatch => {
-            const ttd = try grammar_mod.token_tag_dispatch.token_tag_dispatch(grammar, allocator, expr_id);
+            var ttd = try grammar_mod.token_tag_dispatch.token_tag_dispatch(grammar, allocator, expr_id);
             defer ttd.deinit(allocator);
-            for (ttd.trigger_rule_pairs.items) |pair| try queue.push_back(pair.rule_id);
+            for (ttd.trigger_rule_pairs.items) |pair| try queue.pushBack(allocator, pair.rule_id);
         },
         else => {},
     }
@@ -188,7 +191,7 @@ fn collect_rule_refs(
 
 test "dead code eliminator keeps reachable rules and remaps refs" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
+    const mod = @import("../grammar/mod.zig");
     const GrammarBuilder = mod.GrammarBuilder;
     var builder = try GrammarBuilder.new(gpa);
     defer builder.deinit();
@@ -196,7 +199,7 @@ test "dead code eliminator keeps reachable rules and remaps refs" {
     _ = try builder.add_rule_named("unused", try builder.add_byte_string("z"));
     const keep = try builder.add_rule_named("keep", try builder.add_byte_string("a"));
     const root = try builder.add_rule_named("root", try builder.add_rule_ref(keep));
-    try builder.update_max_tokens(root, 5);
+    builder.update_max_tokens(root, 5);
     const grammar = try builder.into_grammar(gpa, "root", null);
     defer grammar.deinit();
 
@@ -205,7 +208,7 @@ test "dead code eliminator keeps reachable rules and remaps refs" {
     try std.testing.expectEqual(@as(i32, 2), reduced.num_rules());
     try std.testing.expectEqualStrings("keep", reduced.rule(0).name);
     try std.testing.expectEqualStrings("root", reduced.rule(1).name);
-    try std.testing.expectEqual(root, reduced.root_rule_id);
+    try std.testing.expectEqual(@as(i32, 1), reduced.root_rule_id);
     try std.testing.expectEqual(@as(i32, 5), reduced.rule(1).max_tokens);
     const body = reduced.expr(reduced.rule(1).body_expr_id);
     try std.testing.expectEqual(@as(i32, 0), body.data[0]); // ref remapped old keep(1) → 0

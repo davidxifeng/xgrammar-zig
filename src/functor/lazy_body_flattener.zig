@@ -10,7 +10,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const CharacterClassElement = grammar_mod.CharacterClassElement;
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
@@ -48,9 +48,9 @@ pub fn lazy_body_flattener(allocator: Allocator, grammar: *const Grammar) Functo
         const new_body_expr_id = if (rule.is_lazy)
             try build_flattened_lazy_body(&state, rule.body_expr_id)
         else
-            try mutator.visit_expr_id(identity, &state, rule.body_expr_id);
+            try mutator.visit_expr_id(identity{}, &state, rule.body_expr_id);
         state.builder.update_rule_body(@intCast(rule_id), new_body_expr_id);
-        const new_lookahead_id = try mutator.visit_lookahead(identity, &state, rule.lookahead_assertion_id);
+        const new_lookahead_id = try mutator.visit_lookahead(identity{}, &state, rule.lookahead_assertion_id);
         state.builder.update_lookahead_assertion(@intCast(rule_id), new_lookahead_id);
         try state.builder.copy_rule_attributes(@intCast(rule_id), grammar, @intCast(rule_id), identity_id);
     }
@@ -80,7 +80,7 @@ fn build_flattened_lazy_body(
     const base = state.base;
     {
         const ty = base.expr(body_expr_id).ty;
-        if (ty == .Regex or ty == .Substring) return mutator.visit_expr_id(identity, state, body_expr_id);
+        if (ty == .Regex or ty == .Substring) return mutator.visit_expr_id(identity{}, state, body_expr_id);
     }
     // Unwrap chains of single rule references (r ::= (x), x ::= (y), ...) produced by regex
     // conversion, and detect the plus-desugar pattern at the top level.
@@ -96,7 +96,7 @@ fn build_flattened_lazy_body(
     const body = base.expr(cur_body_id);
     if (body.ty != .Choices) {
         std.debug.print("The body of the lazy rule '{s}' cannot be flattened into a terminal-like form\n", .{state.cur_rule_name});
-        return mutator.visit_expr_id(identity, state, cur_body_id);
+        return mutator.visit_expr_id(identity{}, state, cur_body_id);
     }
     var repeat_elements: std.ArrayList(i32) = .empty;
     defer repeat_elements.deinit(gpa);
@@ -108,7 +108,7 @@ fn build_flattened_lazy_body(
     defer new_choice_ids.deinit(gpa);
     for (body.data) |choice_id| {
         if (base.expr(choice_id).ty != .Sequence) {
-            try new_choice_ids.append(gpa, try mutator.visit_expr_id(identity, state, choice_id));
+            try new_choice_ids.append(gpa, try mutator.visit_expr_id(identity{}, state, choice_id));
             continue;
         }
         var elements: std.ArrayList(i32) = .empty;
@@ -116,7 +116,7 @@ fn build_flattened_lazy_body(
         if (!try flatten_sequence_into(state, choice_id, &elements, 0)) {
             // Not flattenable; copy as is and let the terminal-like validation report the error.
             std.debug.print("The body of the lazy rule '{s}' cannot be flattened into a terminal-like form\n", .{state.cur_rule_name});
-            return mutator.visit_expr_id(identity, state, cur_body_id);
+            return mutator.visit_expr_id(identity{}, state, cur_body_id);
         }
         try new_choice_ids.append(gpa, try state.builder.add_sequence(elements.items));
     }
@@ -546,9 +546,9 @@ fn is_rule_ref_to(base: *const Grammar, expr_id: i32, rule_id: i32) bool {
 
 test "lazy body flattener unwraps plus-desugar pattern" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
-    const GrammarBuilder = mod.GrammarBuilder;
-    var builder = try GrammarBuilder.new(gpa);
+    const mod = @import("../grammar/mod.zig");
+    const GB = mod.grammar_builder.GrammarBuilder;
+    var builder = try GB.new(gpa);
     defer builder.deinit();
     // part ::= "a" part | "a" (plus-desugar); root[+lazy] ::= part "b" — flattened to
     // root ::= ("a" [a]* …) style terminal body: cc cc*.
@@ -556,10 +556,10 @@ test "lazy body flattener unwraps plus-desugar pattern" {
     const part = try builder.add_rule_named("part", mod.NO_EXPR);
     const self_ref = try builder.add_rule_ref(part);
     const rec = try builder.add_sequence(&.{ cc, self_ref });
-    const part_body = try builder.add_choices(&.{ rec, cc });
-    try builder.update_rule_body(part, part_body);
+    const part_body = try builder.add_choices(&.{ rec, try builder.add_sequence(&.{cc}) });
+    builder.update_rule_body(part, part_body);
     const part_ref = try builder.add_rule_ref(part);
-    const root_body = try builder.add_sequence(&.{ part_ref, try builder.add_byte_string("b") });
+    const root_body = try builder.add_choices(&.{try builder.add_sequence(&.{ part_ref, try builder.add_byte_string("b") })});
     const root = try builder.add_rule_named("root", root_body);
     builder.update_lazy(root, true);
     const grammar = try builder.into_grammar(gpa, "root", null);
@@ -570,7 +570,9 @@ test "lazy body flattener unwraps plus-desugar pattern" {
     const printer = mod.printer;
     const ebnf = try printer.to_string_ebnf(flattened, gpa);
     defer gpa.free(ebnf);
-    // The plus pattern (a a* | a) is rewritten into the character-class star form.
     try std.testing.expect(std.mem.indexOf(u8, ebnf, "[a]*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ebnf, "part") == null);
+// the root body must not reference `part` any more
+    const root_line = std.mem.indexOf(u8, ebnf, "root[") orelse std.mem.indexOf(u8, ebnf, "root ::=") orelse return error.TestUnexpectedResult;
+    const line_end = std.mem.indexOfScalarPos(u8, ebnf, root_line, '\n').?;
+    try std.testing.expect(std.mem.indexOf(u8, ebnf[root_line..line_end], "part") == null);
 }

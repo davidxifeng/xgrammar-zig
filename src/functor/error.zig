@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 /// The error set of the grammar passes (Rust `FunctorError` enum; the payload of each
 /// variant travels through the optional `FunctorErrorInfo` diagnostic, see the
 /// support/parser wave convention).
-pub const FunctorError = Allocator.Error || error{
+pub const FunctorError = Allocator.Error || @import("../support/mod.zig").Compact2dArrayError || error{
     /// A repetition range with a negative lower bound, or an upper bound below the lower one.
     InvalidRepetitionRange,
     /// A rule body could not be compiled into an automaton (e.g. an invalid regex).
@@ -59,10 +59,10 @@ test "format functor error messages" {
     const msg = try format_message(gpa, .{ .InvalidRepetitionRange = .{ .lower = 2, .upper = -1 } });
     defer gpa.free(msg);
     try std.testing.expectEqualStrings("Invalid repetition range {2, -1}", msg);
-    const lazy = try format_message(gpa, .{ .LazyRuleBodyNotChoices = .{ .rule_name = "x" } });
+    const lazy = try format_message(gpa, .{ .LazyRuleBodyNotChoices = "x" });
     defer gpa.free(lazy);
     try std.testing.expectEqualStrings("lazy rule 'x' must have a terminal-like body", lazy);
-    const elem = try format_message(gpa, .{ .LazyRuleElementNotTerminal = .{ .rule_name = "y" } });
+    const elem = try format_message(gpa, .{ .LazyRuleElementNotTerminal = "y" });
     defer gpa.free(elem);
     try std.testing.expectEqualStrings(
         "lazy rule 'y' must have a terminal-like body (strings, character classes, and regexes that " ++

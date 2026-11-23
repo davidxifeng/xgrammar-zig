@@ -10,14 +10,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExprType = grammar_mod.GrammarExprType;
 const in_place = @import("in_place_grammar_rewriter.zig");
 
 /// Inlines leading references to simple rules in place (the `GrammarFunctor.rule_inliner` pass).
-pub fn rule_inliner(grammar: *Grammar) Allocator.Error!void {
+pub fn rule_inliner(grammar: *Grammar) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!void {
     const gpa = grammar.arena.allocator();
     var inliner = RuleInliner{
         .original_body_expr_ids = .empty,
@@ -57,12 +57,12 @@ const RuleInliner = struct {
     }
 
     /// The overridden `visit_choices` (see the Rust trait impl).
-    fn visit_choices(
+    pub fn visit_choices(
         self: *RuleInliner,
         builder: *GrammarBuilder,
         memo: []i32,
         expr_id: i32,
-    ) Allocator.Error!i32 {
+    ) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!i32 {
         const gpa = builder.allocator;
         const size = builder.grammar_expr(expr_id).len();
         var new_choice_ids: ?std.ArrayList(i32) = null;
@@ -155,14 +155,14 @@ fn can_rule_be_inlined(gpa: Allocator, grammar: *const Grammar, rule_id: i32) Al
 
 test "rule inliner splices the referenced choices in front" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
-    const GrammarBuilder = mod.GrammarBuilder;
-    var builder = try GrammarBuilder.new(gpa);
+    const mod = @import("../grammar/mod.zig");
+    const GB = mod.grammar_builder.GrammarBuilder;
+    var builder = try GB.new(gpa);
     defer builder.deinit();
     // pfx ::= "a" | "b"; root ::= (pfx "x") | "c"
     const pfx = try builder.add_rule_named(
         "pfx",
-        try builder.add_choices(&.{ try builder.add_byte_string("a"), try builder.add_byte_string("b") }),
+        try builder.add_choices(&.{ try builder.add_sequence(&.{try builder.add_byte_string("a")}), try builder.add_sequence(&.{try builder.add_byte_string("b")}) }),
     );
     const seq1 = try builder.add_sequence(&.{ try builder.add_rule_ref(pfx), try builder.add_byte_string("x") });
     const root_body = try builder.add_choices(&.{ seq1, try builder.add_byte_string("c") });
@@ -177,7 +177,7 @@ test "rule inliner splices the referenced choices in front" {
     defer gpa.free(ebnf);
     // `pfx` itself stays (dead code elimination removes it later); the choice is spliced.
     try std.testing.expectEqualStrings(
-        "pfx ::= (\"a\" | \"b\")\nroot ::= ((\"a\" \"x\") | (\"b\" \"x\") | \"c\")\n",
+        "pfx ::= ((\"a\") | (\"b\"))\nroot ::= ((\"a\" \"x\") | (\"b\" \"x\") | \"c\")\n",
         ebnf,
     );
 }

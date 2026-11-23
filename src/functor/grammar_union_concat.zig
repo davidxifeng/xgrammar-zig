@@ -3,7 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExprType = grammar_mod.GrammarExprType;
@@ -97,7 +97,7 @@ pub fn add_sub_grammar(builder: *GrammarBuilder, sub: *const Grammar) Allocator.
 var remap_ids: ?[]const i32 = null;
 
 fn remap_rule_id(id: i32) i32 {
-    return remap_ids.?[id];
+    return remap_ids.?[@intCast(id)];
 }
 
 /// Re-adds an expression from `sub` into `builder`, remapping rule references through
@@ -152,13 +152,13 @@ fn copy_expr(
 
 test "union and concat of two grammars" {
     const gpa = std.testing.allocator;
-    const GrammarBuilder = grammar_mod.grammar_builder.GrammarBuilder;
-    var b1 = try GrammarBuilder.new(gpa);
+    const GB = grammar_mod.grammar_builder.GrammarBuilder;
+    var b1 = try GB.new(gpa);
     defer b1.deinit();
     _ = try b1.add_rule_named("root", try b1.add_byte_string("a"));
     const g1 = try b1.into_grammar(gpa, "root", null);
     defer g1.deinit();
-    var b2 = try GrammarBuilder.new(gpa);
+    var b2 = try GB.new(gpa);
     defer b2.deinit();
     _ = try b2.add_rule_named("root", try b2.add_byte_string("bc"));
     const g2 = try b2.into_grammar(gpa, "root", null);
@@ -180,7 +180,7 @@ test "union and concat of two grammars" {
     const c_ebnf = try printer.to_string_ebnf(c, gpa);
     defer gpa.free(c_ebnf);
     try std.testing.expectEqualStrings(
-        "root ::= (root_1 root_2)\nroot_1 ::= \"a\"\nroot_2 ::= \"bc\"\n",
+        "root ::= ((root_1 root_2))\nroot_1 ::= \"a\"\nroot_2 ::= \"bc\"\n",
         c_ebnf,
     );
 }

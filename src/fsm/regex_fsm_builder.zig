@@ -51,7 +51,7 @@ pub const RegexFsmBuilder = struct {
         rule_hint: []const u8,
         err_msg: ?*?[]u8,
     ) regex_ir_errors!FsmWithStartEnd {
-        const fsm_wse = try build(allocator, regex, builder, rule_hint, err_msg);
+        var fsm_wse = try build(allocator, regex, builder, rule_hint, err_msg);
         errdefer fsm_wse.deinit();
         var any = false;
         for (forbidden_chars) |f| {

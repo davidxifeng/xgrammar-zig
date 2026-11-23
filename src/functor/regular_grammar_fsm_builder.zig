@@ -9,11 +9,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExpr = grammar_mod.GrammarExpr;
 const GrammarExprType = grammar_mod.GrammarExprType;
-const fsm_mod = @import("fsm/mod.zig");
+const fsm_mod = @import("../fsm/mod.zig");
 const Fsm = fsm_mod.Fsm;
 const FsmWithStartEnd = fsm_mod.FsmWithStartEnd;
 const grammar_fsm_builder_mod = @import("grammar_fsm_builder.zig");

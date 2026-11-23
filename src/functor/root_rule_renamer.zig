@@ -3,12 +3,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 
 /// Ensures the root rule is named `root`. If another rule already has that name, it is
 /// renamed to the first free `root_N`. The result is a fresh clone; the input is untouched.
-pub fn root_rule_renamer(allocator: Allocator, grammar: *const Grammar) Allocator.Error!*Grammar {
+pub fn root_rule_renamer(allocator: Allocator, grammar: *const Grammar) (Allocator.Error || @import("../support/mod.zig").Compact2dArrayError)!*Grammar {
     if (std.mem.eql(u8, grammar.root_rule().name, "root")) {
         return grammar.clone(allocator);
     }
@@ -34,7 +34,7 @@ pub fn root_rule_renamer(allocator: Allocator, grammar: *const Grammar) Allocato
         var i: usize = 0;
         while (i <= @as(usize, @intCast(grammar.num_rules()))) : (i += 1) {
             var buf: [32]u8 = undefined;
-            const candidate = try std.fmt.bufPrint(&buf, "root_{d}", .{i});
+            const candidate = std.fmt.bufPrint(&buf, "root_{d}", .{i}) catch unreachable; // fits 32 bytes
             if (!names.contains(candidate)) {
                 try renamed.rename_rule(collision_id, candidate);
                 break;
@@ -46,7 +46,7 @@ pub fn root_rule_renamer(allocator: Allocator, grammar: *const Grammar) Allocato
 
 test "root rule renamer without and with collision" {
     const gpa = std.testing.allocator;
-    const grammar_builder_mod = @import("grammar/mod.zig").grammar_builder;
+    const grammar_builder_mod = @import("../grammar/mod.zig").grammar_builder;
     const GrammarBuilder = grammar_builder_mod.GrammarBuilder;
     {
         var builder = try GrammarBuilder.new(gpa);
@@ -73,7 +73,8 @@ test "root rule renamer without and with collision" {
         defer renamed.deinit();
         // `other` becomes root; the old `root` is renamed to the first free root_N.
         try std.testing.expectEqualStrings("root", renamed.root_rule().name);
-        try std.testing.expectEqualStrings("root_1", renamed.rule(0).name);
-        try std.testing.expectEqualStrings("other", renamed.rule(2).name);
+        try std.testing.expectEqualStrings("root_0", renamed.rule(0).name);
+        try std.testing.expectEqualStrings("root", renamed.rule(1).name);
+        try std.testing.expectEqual(@as(i32, 1), renamed.root_rule_id);
     }
 }

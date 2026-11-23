@@ -8,17 +8,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExpr = grammar_mod.GrammarExpr;
 const GrammarExprType = grammar_mod.GrammarExprType;
 const TagDispatch = grammar_mod.TagDispatch;
 const TokenTagDispatch = grammar_mod.TokenTagDispatch;
-const fsm_mod = @import("fsm/mod.zig");
+const fsm_mod = @import("../fsm/mod.zig");
 const CompactFsm = fsm_mod.CompactFsm;
 const CompactFsmWithStartEnd = fsm_mod.CompactFsmWithStartEnd;
 const CompactFsmWithStartEndWithSize = fsm_mod.CompactFsmWithStartEndWithSize;
+const FsmWithStartEndWithSize = fsm_mod.FsmWithStartEndWithSize;
 const Fsm = fsm_mod.Fsm;
 const FsmWithStartEnd = fsm_mod.FsmWithStartEnd;
 const RegexFsmBuilder = fsm_mod.RegexFsmBuilder;
@@ -61,7 +62,7 @@ pub const GrammarFsmBuilder = struct {
             var rule_id: i32 = 0;
             while (rule_id < builder.num_rules()) : (rule_id += 1) {
                 const rule = builder.get_rule(rule_id);
-                const rule_fsm = try ExpressionFsmBuilder.build_expression_fsm(
+                var rule_fsm = try ExpressionFsmBuilder.build_expression_fsm(
                     gpa,
                     &builder,
                     rule.body_expr_id,
@@ -98,17 +99,22 @@ pub const GrammarFsmBuilder = struct {
         errdefer compact_complete_fsm.deinit();
         var compact_per_rule_fsms: std.ArrayList(?CompactFsmWithStartEndWithSize) = .empty;
         errdefer {
-            for (compact_per_rule_fsms.items) |item| if (item) |*f| f.deinit();
+            for (compact_per_rule_fsms.items) |item_const| {
+                if (item_const) |mut_const| {
+                    var f = mut_const;
+                    f.deinit();
+                }
+            }
             compact_per_rule_fsms.deinit(gpa);
         }
         for (per_rule_fsms.items) |fsm| {
             // `CompactFsmWithStartEnd.new` consumes `ends`; the source keeps its own list.
             var ends_dup: std.ArrayList(i32) = .empty;
-            try ends_dup.appendSlice(gpa, fsm.fsm.ends.items);
+            try ends_dup.appendSlice(gpa, fsm.ends.items);
             const with_start_end = try CompactFsmWithStartEnd.new(
                 gpa,
                 compact_complete_fsm.clone(),
-                fsm.fsm.get_start(),
+                fsm.start,
                 ends_dup,
                 false,
             );
@@ -122,7 +128,12 @@ pub const GrammarFsmBuilder = struct {
         // and are released here (PORTING: grammar.zig `set_fsms` doc).
         try grammar.set_fsms(compact_complete_fsm, compact_per_rule_fsms.items);
         compact_complete_fsm.deinit();
-        for (compact_per_rule_fsms.items) |item| if (item) |*f| f.deinit();
+        for (compact_per_rule_fsms.items) |item_const| {
+            if (item_const) |mut_const| {
+                var f = mut_const;
+                f.deinit();
+            }
+        }
         compact_per_rule_fsms.deinit(gpa);
         complete_fsm.deinit();
         for (per_rule_fsms.items) |*item| item.deinit();
@@ -278,7 +289,7 @@ pub const GrammarFsmBuilder = struct {
         regex_pattern: []const u8,
         json_string: bool,
         err_msg: ?*?[]u8,
-    ) @import("fsm/regex_ir.zig").RegexError!FsmWithStartEnd {
+    ) @import("../fsm/regex_ir.zig").RegexError!FsmWithStartEnd {
         const gpa = allocator;
         const result = if (json_string)
             RegexFsmBuilder.build_with_forbidden_chars(gpa, regex_pattern, json_string_forbidden_chars(), null, "", err_msg)

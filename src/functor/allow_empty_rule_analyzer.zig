@@ -3,10 +3,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarExprType = grammar_mod.GrammarExprType;
-const fsm_mod = @import("fsm/mod.zig");
+const fsm_mod = @import("../fsm/mod.zig");
 const RegexFsmBuilder = fsm_mod.RegexFsmBuilder;
 
 /// Returns the sorted ids of rules that can derive the empty string.
@@ -17,7 +17,7 @@ pub fn allow_empty_rule_ids(allocator: Allocator, grammar: *const Grammar) Alloc
     try find_explicit_empty_rules(allocator, grammar, &empty);
     const graph = try rule_ref_graph(allocator, grammar);
     defer {
-        for (graph) |refs| refs.deinit(allocator);
+        for (graph) |*refs| refs.deinit(allocator);
         allocator.free(graph);
     }
     try find_indirect_empty_rules(allocator, grammar, &empty, graph);
@@ -79,12 +79,12 @@ fn visit_refs(
         },
         .RuleRef, .Repeat => try graph[@intCast(expr.data[0])].append(allocator, cur_rule),
         .TagDispatch => {
-            const td = try grammar_mod.tag_dispatch.tag_dispatch(grammar, allocator, expr_id);
+            var td = try grammar_mod.tag_dispatch.tag_dispatch(grammar, allocator, expr_id);
             defer td.deinit(allocator);
             for (td.tag_rule_pairs.items) |pair| try graph[@intCast(pair.rule_id)].append(allocator, cur_rule);
         },
         .TokenTagDispatch => {
-            const ttd = try grammar_mod.token_tag_dispatch.token_tag_dispatch(grammar, allocator, expr_id);
+            var ttd = try grammar_mod.token_tag_dispatch.token_tag_dispatch(grammar, allocator, expr_id);
             defer ttd.deinit(allocator);
             for (ttd.trigger_rule_pairs.items) |pair| try graph[@intCast(pair.rule_id)].append(allocator, cur_rule);
         },
@@ -167,11 +167,11 @@ fn find_indirect_empty_rules(
     empty: *std.AutoHashMap(i32, void),
     graph: []const std.ArrayList(i32),
 ) Allocator.Error!void {
-    var queue = std.Deque(i32).init(allocator);
-    defer queue.deinit();
+    var queue: std.Deque(i32) = .empty;
+    defer queue.deinit(allocator);
     var it = empty.keyIterator();
-    while (it.next()) |key| try queue.push_back(key.*);
-    while (queue.pop_front()) |rule_id| {
+    while (it.next()) |key| try queue.pushBack(allocator,key.*);
+    while (queue.popFront()) |rule_id| {
         for (graph[@intCast(rule_id)].items) |referrer| {
             if (empty.contains(referrer)) continue;
             const body = grammar.expr(grammar.rule(@intCast(referrer)).body_expr_id);
@@ -184,7 +184,7 @@ fn find_indirect_empty_rules(
             }
             if (is_epsilon) {
                 try empty.put(referrer, {});
-                try queue.push_back(referrer);
+                try queue.pushBack(allocator,referrer);
             }
         }
     }
@@ -192,17 +192,21 @@ fn find_indirect_empty_rules(
 
 test "allow empty rule ids direct and indirect" {
     const gpa = std.testing.allocator;
-    const mod = @import("grammar/mod.zig");
+    const mod = @import("../grammar/mod.zig");
     const GrammarBuilder = mod.GrammarBuilder;
     var builder = try GrammarBuilder.new(gpa);
     defer builder.deinit();
-    // inner ::= "" | [a-z]; mid ::= inner; root ::= mid "x"
+    // inner ::= ("" | [a-z]); mid ::= (inner); root ::= ((mid "x")) — normalized shape:
+    // every rule body is a choices of sequences.
     const cc = try builder.add_character_class(&.{mod.CharacterClassElement.new('a', 'z')}, false);
     const empty = try builder.add_empty_str();
-    const inner_body = try builder.add_choices(&.{ empty, cc });
+    const inner_body = try builder.add_choices(&.{ empty, try builder.add_sequence(&.{cc}) });
     const inner = try builder.add_rule_named("inner", inner_body);
-    const mid = try builder.add_rule_named("mid", try builder.add_rule_ref(inner));
-    const root = try builder.add_rule_named("root", try builder.add_sequence(&.{ try builder.add_rule_ref(mid), try builder.add_byte_string("x") }));
+    const mid = try builder.add_rule_named("mid", try builder.add_choices(&.{try builder.add_sequence(&.{try builder.add_rule_ref(inner)})}));
+    const root = try builder.add_rule_named(
+        "root",
+        try builder.add_choices(&.{try builder.add_sequence(&.{ try builder.add_rule_ref(mid), try builder.add_byte_string("x") })}),
+    );
     const grammar = try builder.into_grammar(gpa, "root", null);
     defer grammar.deinit();
 

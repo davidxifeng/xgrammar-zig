@@ -4,16 +4,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
-const parser_mod = @import("parser/mod.zig");
+const parser_mod = @import("../parser/mod.zig");
 const EbnfError = parser_mod.EbnfError;
 const EbnfErrorInfo = parser_mod.EbnfErrorInfo;
 const root_rule_renamer_mod = @import("root_rule_renamer.zig");
 const structure_normalizer_mod = @import("structure_normalizer.zig");
+const error_mod = @import("error.zig");
+const FunctorError = error_mod.FunctorError;
 
 /// Normalizes a grammar: rename the root to `root`, then structure-normalize it.
-pub fn grammar_normalizer(allocator: Allocator, grammar: *const Grammar) Allocator.Error!*Grammar {
+pub fn grammar_normalizer(allocator: Allocator, grammar: *const Grammar) FunctorError!*Grammar {
     const renamed = try root_rule_renamer_mod.root_rule_renamer(allocator, grammar);
     defer renamed.deinit();
     return structure_normalizer_mod.structure_normalizer(allocator, renamed);
@@ -29,14 +31,18 @@ pub fn from_ebnf(
     ebnf_string: []const u8,
     root_rule_name: []const u8,
     diag: ?*EbnfErrorInfo,
-) (Allocator.Error || EbnfError)!*Grammar {
+) (Allocator.Error || EbnfError || FunctorError)!*Grammar {
     const parsed = try parser_mod.ebnf_to_grammar_no_normalization(gpa, ebnf_string, root_rule_name, diag);
     defer parsed.deinit();
-    const normalized = grammar_normalizer(gpa, parsed) catch |err| {
-        if (diag) |d| {
-            d.* = .{ .normalization = try gpa.dupe(u8, "grammar normalization failed") };
-        }
-        return error.Normalization;
+    const normalized = grammar_normalizer(gpa, parsed) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EmptyIndptr, error.NonZeroStart, error.NotMonotonic, error.BadEnd => return err,
+        else => {
+            if (diag) |d| {
+                d.* = .{ .normalization = try gpa.dupe(u8, "grammar normalization failed") };
+            }
+            return error.Normalization;
+        },
     };
     return normalized;
 }
@@ -135,7 +141,8 @@ const BUILTIN_JSON_GRAMMAR =
     \\fraction ::= "" | "." [0-9] [0-9]*
     \\exponent ::= "" |  "e" sign [0-9] [0-9]* | "E" sign [0-9] [0-9]*
     \\sign ::= "" | "+" | "-"
-    \\;
+    \\
+    ;
 
 test "builtin json grammar normalizes and accepts objects" {
     const gpa = std.testing.allocator;
@@ -159,5 +166,5 @@ test "from_ebnf renames the root and normalizes" {
     const printer = grammar_mod.printer;
     const ebnf = try printer.to_string_ebnf(grammar, gpa);
     defer gpa.free(ebnf);
-    try std.testing.expectEqualStrings("root ::= ((\"a\" \"c\") | (\"b\" \"c\"))\n", ebnf);
+    try std.testing.expectEqualStrings("root ::= ((root_1 \"c\"))\nroot_1 ::= ((\"a\") | (\"b\"))\n", ebnf);
 }

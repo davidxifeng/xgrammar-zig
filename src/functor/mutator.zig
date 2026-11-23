@@ -9,7 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExprType = grammar_mod.GrammarExprType;
@@ -38,6 +38,14 @@ pub const MutatorState = struct {
 /// Rebuilds the grammar with `mutator`'s overrides (the shared Rust trait default
 /// `GrammarMutator::apply`). Rules are created empty first (preserving rule ids), then each
 /// body and lookahead assertion is visited.
+/// The struct type behind a pass value/pointer (dispatchers accept either form).
+fn PassT(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.child,
+        else => T,
+    };
+}
+
 pub fn apply(mutator: anytype, allocator: Allocator, grammar: *const Grammar) FunctorError!*Grammar {
     var state = MutatorState{
         .base = grammar,
@@ -83,7 +91,7 @@ pub fn visit_expr_id(mutator: anytype, state: *MutatorState, expr_id: i32) Funct
 /// Dispatches on the expression type (the Rust trait default), preferring the mutator's
 /// overrides. `data` is borrowed from the source grammar for the duration of the call.
 pub fn visit_expr(mutator: anytype, state: *MutatorState, ty: GrammarExprType, data: []const i32) FunctorError!i32 {
-    const M = PassT(mutator);
+    const M = PassT(@TypeOf(mutator));
     return switch (ty) {
         .Sequence => if (comptime @hasDecl(M, "visit_sequence"))
             mutator.visit_sequence(state, data)
@@ -171,7 +179,7 @@ pub fn visit_element_default(state: *MutatorState, ty: GrammarExprType, data: []
 /// the source grammar, so they are decoded and re-encoded rather than copied raw.
 pub fn visit_tag_dispatch_default(state: *MutatorState, data: []const i32) FunctorError!i32 {
     const gpa = state.gpa();
-    const tag_dispatch = try tag_dispatch_mod.decode_tag_dispatch_data(state.base, gpa, data);
+    var tag_dispatch = try tag_dispatch_mod.decode_tag_dispatch_data(state.base, gpa, data);
     defer tag_dispatch.deinit(gpa);
     return state.builder.add_tag_dispatch(&tag_dispatch);
 }
@@ -180,7 +188,7 @@ pub fn visit_tag_dispatch_default(state: *MutatorState, data: []const i32) Funct
 /// default; rule ids are preserved by the rule-ordering invariant of `apply`).
 pub fn visit_token_tag_dispatch_default(state: *MutatorState, data: []const i32) FunctorError!i32 {
     const gpa = state.gpa();
-    const ttd = try token_tag_dispatch_mod.decode_token_tag_dispatch_data(gpa, data);
+    var ttd = try token_tag_dispatch_mod.decode_token_tag_dispatch_data(gpa, data);
     defer ttd.deinit(gpa);
     return state.builder.add_token_tag_dispatch(&ttd);
 }

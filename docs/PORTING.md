@@ -85,6 +85,40 @@
      无稳定 std 级全局访问器)。
    - `escape_bytes` 的 `parse_utf8(..., true)` 按参照不可能是错误,展开处 `catch unreachable`。
 
+6. **functor 波次(WaveFunctor)**:
+   - Rust trait(`GrammarMutator`/`InPlaceGrammarRewriter`)无 Zig 对应:`apply`/`visit_*`
+     默认实现改为 mutator/in_place_grammar_rewriter 模块内自由函数,各 pass 以
+     `anytype` + comptime `@hasDecl` 鸭子分派选择覆盖(传值或指针均可,`PassT` 解包)。
+     **pass 的 `visit_*` 覆盖方法必须 `pub`**(0.17 的 `@hasDecl` 对非 pub 声明返回 false)。
+   - `FunctorError` 枚举带数据 → error set
+     `{InvalidRepetitionRange, FsmBuild, LazyRuleBodyNotChoices, LazyRuleElementNotTerminal}`
+     (+ OOM 与 `Compact2dArrayError` 透传)+ 诊断 `FunctorErrorInfo`(union(enum)),
+     经可选出参 `diag: ?*FunctorErrorInfo` 回传;`format_message` 逐字复现 Rust Display。
+     `GrammarFsmBuilder.regex`/`from_regular_grammar` 的 `Result<_, String>` 走 fsm 波
+     `err_msg: ?*?[]?u8` 出参约定(错误集 `RegexError` / `error{Flatten}`)。
+   - `Grammar::union` → `grammar_union_concat.union_`(`union` 是 Zig 关键字);
+     `Grammar::union/concat/from_ebnf/builtin_json_grammar` 等 impl 块按 grammar 波约定
+     落为对应文件内自由函数(首参 allocator)。
+   - `copy_rule_attributes` 的规则 id 闭包:Zig 无闭包,重映射场景
+     (dead_code_eliminator)展开为本地 `copy_attributes_remapped`;
+     `add_sub_grammar` 用模块级 `remap_ids` 片段传递(仅调用期间有效)。
+   - `OnceLock` 静态(json_string_forbidden_chars)→ 函数局部 `static` 变量惰性初始化。
+   - 结构化哈希的 `BTreeMap`/`BTreeSet`:`hash_and_target` 候选排序去重后遍历,
+     状态映射按 BFS 发现序赋新 id、输出按旧 id 排序(逐点对应 Rust 语义);
+     边表统一 `fsm_edge.sortEdges` 排序,遍历序确定。
+   - repetition_range_expander 的 `HashMap<Vec<i64>, i32>` 缓存键 → i64 小端字节串
+     `StringHashMap`(键由缓存自持 allocator 分配/释放,勿与 builder arena 混用)。
+   - mod.rs → mod.zig:模块命名空间以 `<name>_mod` 暴露,Rust `pub use` 名
+     (与文件名冲突的函数)保留原名为包级 re-export;`GrammarFsmBuilder` 各入口
+     (from_regular_grammar/tag_dispatch/token_tag_dispatch/byte_string/rule_ref/
+     character_class/choices/json_string_forbidden_chars/regex/sequence)签名与参照
+     同名同形(仅按约定加 allocator 首参与诊断/err_msg 出参)。
+   - 清单外的依赖文件一并直译:`byte_string_fuser.rs`、`grammar_optimizer.rs`、
+     `single_element_expr_eliminator.rs`(Rust `pub(crate)`,structure_normalizer/
+     grammar_optimizer 的依赖)。
+   - fsm 波 regex_fsm_builder.zig 的 `const fsm_wse` + `errdefer …deinit()` 编译错误
+     (`*const T` 不能 deinit)已顺手修为 `var`(一行,已在上游交付物上)。
+
 ## 工程纪律
 
 - 纯 Zig 0.17.1,零外部依赖;std API 拿不准就查

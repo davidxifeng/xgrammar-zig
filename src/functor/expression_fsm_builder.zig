@@ -4,12 +4,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExpr = grammar_mod.GrammarExpr;
 const GrammarExprType = grammar_mod.GrammarExprType;
-const fsm_mod = @import("fsm/mod.zig");
+const fsm_mod = @import("../fsm/mod.zig");
 const Fsm = fsm_mod.Fsm;
 const FsmWithStartEnd = fsm_mod.FsmWithStartEnd;
 const RegexFsmBuilder = fsm_mod.RegexFsmBuilder;
@@ -54,10 +54,10 @@ pub const ExpressionFsmBuilder = struct {
         diag: ?*FunctorErrorInfo,
     ) FunctorError!FsmWithStartEnd {
         const ty = exprs.grammar_expr(expr_id).ty;
-        const result = try build(allocator, exprs, expr_id, rule_name, create_rules, diag);
+        var result = try build(allocator, exprs, expr_id, rule_name, create_rules, diag);
         errdefer result.deinit();
         if (ty == .TagDispatch or ty == .TokenTagDispatch) return result;
-        const simplified = try result.simplify_epsilon(allocator);
+        var simplified = try result.simplify_epsilon(allocator);
         result.deinit();
         const minimized = try simplified.merge_equivalent_states(allocator);
         simplified.deinit();
@@ -81,12 +81,13 @@ pub const ExpressionFsmBuilder = struct {
             .create_rules = create_rules,
         };
         errdefer builder.target_fsm.deinit();
-        const ends = try builder.build_expression(expr_id, 0, diag);
+        var ends = try builder.build_expression(expr_id, 0, diag);
+        defer ends.deinit(allocator);
         var ends_list: std.ArrayList(i32) = .empty;
         errdefer ends_list.deinit(allocator);
         try ends_list.appendSlice(allocator, ends.items);
         const result = try FsmWithStartEnd.new(allocator, builder.target_fsm, 0, ends_list, false);
-        builder.target_fsm = Fsm.empty(allocator); // moved into the result
+        builder.target_fsm = try Fsm.empty(allocator); // moved into the result
         return result;
     }
 
@@ -102,7 +103,7 @@ pub const ExpressionFsmBuilder = struct {
         const ty = expr.ty;
         const data = try gpa.dupe(i32, expr.data);
         defer gpa.free(data);
-        const fsm = &self.target_fsm;
+        var fsm = &self.target_fsm;
         var ends: std.ArrayList(i32) = .empty;
         errdefer ends.deinit(gpa);
         switch (ty) {
@@ -138,58 +139,58 @@ pub const ExpressionFsmBuilder = struct {
                 try ends.append(gpa, end);
             },
             .Sequence => {
-                const result = try self.build_sequence(data, start, diag);
+                var result = try self.build_sequence(data, start, diag);
                 defer result.deinit(gpa);
                 try ends.appendSlice(gpa, result.items);
             },
             .Choices => {
-                const result = try self.build_choices(data, start, diag);
+                var result = try self.build_choices(data, start, diag);
                 defer result.deinit(gpa);
                 try ends.appendSlice(gpa, result.items);
             },
             .Regex => {
-                const built = self.exprs.grammar_expr(expr_id);
+                var built = self.exprs.grammar_expr(expr_id);
                 const pattern = try built.regex_pattern(gpa);
                 defer gpa.free(pattern);
                 const json_string = built.regex_is_json_string();
-                const result = try self.build_regex(pattern, json_string, start, diag);
+                var result = try self.build_regex(pattern, json_string, start, diag);
                 defer result.deinit(gpa);
                 try ends.appendSlice(gpa, result.items);
             },
             .Substring => {
-                const built = self.exprs.grammar_expr(expr_id);
+                var built = self.exprs.grammar_expr(expr_id);
                 const chunks = try built.substring_chunks(gpa);
                 defer {
                     for (chunks) |c| gpa.free(c);
                     gpa.free(chunks);
                 }
-                const suffix_fsm = try SuffixAutomata.build(gpa, chunks);
+                var suffix_fsm = try SuffixAutomata.build(gpa, chunks);
                 defer suffix_fsm.deinit();
-                const mapped = try self.append_fsm(suffix_fsm, start);
+                var mapped = try self.append_fsm(suffix_fsm, start);
                 defer mapped.deinit(gpa);
                 try ends.appendSlice(gpa, mapped.items);
             },
             .TagDispatch => {
-                const tag_dispatch = try grammar_mod.tag_dispatch.TagDispatch.decode(
+                var tag_dispatch = try grammar_mod.tag_dispatch.TagDispatch.decode(
                     gpa,
                     data,
                     BuilderExprContext{ .builder = self.exprs },
                 );
                 defer tag_dispatch.deinit(gpa);
-                const dispatch_fsm = GrammarFsmBuilder.tag_dispatch(gpa, &tag_dispatch) orelse {
+                var dispatch_fsm = (try GrammarFsmBuilder.tag_dispatch(gpa, &tag_dispatch)) orelse {
                     const message = try gpa.dupe(u8, "Failed to build tag dispatch FSM");
                     error_mod.set_diag(diag, .{ .FsmBuild = message });
                     return error.FsmBuild;
                 };
                 defer dispatch_fsm.deinit();
-                const mapped = try self.append_fsm(dispatch_fsm, start);
+                var mapped = try self.append_fsm(dispatch_fsm, start);
                 defer mapped.deinit(gpa);
                 try ends.appendSlice(gpa, mapped.items);
             },
             .TokenTagDispatch => {
-                const ttd = try grammar_mod.token_tag_dispatch.decode_token_tag_dispatch_data(gpa, data);
+                var ttd = try grammar_mod.token_tag_dispatch.decode_token_tag_dispatch_data(gpa, data);
                 defer ttd.deinit(gpa);
-                const ttd_ends = try GrammarFsmBuilder.build_token_tag_dispatch(fsm, &ttd, start);
+                var ttd_ends = try GrammarFsmBuilder.build_token_tag_dispatch(fsm, &ttd, start);
                 defer ttd_ends.deinit(gpa);
                 try ends.appendSlice(gpa, ttd_ends.items);
             },
@@ -210,12 +211,12 @@ pub const ExpressionFsmBuilder = struct {
             try end_states.append(gpa, start);
             return end_states;
         }
-        const first_ends = try self.build_expression(elements[0], start, diag);
+        var first_ends = try self.build_expression(elements[0], start, diag);
         defer first_ends.deinit(gpa);
         try end_states.appendSlice(gpa, first_ends.items);
         for (elements[1..]) |element| {
             const element_start = try self.target_fsm.add_state();
-            const next_end_states = try self.build_expression(element, element_start, diag);
+            var next_end_states = try self.build_expression(element, element_start, diag);
             defer next_end_states.deinit(gpa);
             for (end_states.items) |previous_end| {
                 try self.target_fsm.add_epsilon_edge(previous_end, element_start);
@@ -249,14 +250,14 @@ pub const ExpressionFsmBuilder = struct {
             return end_states;
         }
         if (non_empty.items.len == 1 and !nullable) {
-            const single = try self.build_expression(non_empty.items[0], start, diag);
+            var single = try self.build_expression(non_empty.items[0], start, diag);
             defer single.deinit(gpa);
             try end_states.appendSlice(gpa, single.items);
             return end_states;
         }
         for (non_empty.items) |choice| {
             const branch_start = try self.target_fsm.add_state();
-            const branch_end_states = try self.build_expression(choice, branch_start, diag);
+            var branch_end_states = try self.build_expression(choice, branch_start, diag);
             defer branch_end_states.deinit(gpa);
             try self.target_fsm.add_epsilon_edge(start, branch_start);
             try end_states.appendSlice(gpa, branch_end_states.items);
@@ -285,11 +286,10 @@ pub const ExpressionFsmBuilder = struct {
             RegexFsmBuilder.build_with_forbidden_chars(gpa, pattern, GrammarFsmBuilder.json_string_forbidden_chars(), builder, rule_hint, &err_msg)
         else
             RegexFsmBuilder.build(gpa, pattern, builder, rule_hint, &err_msg);
-        const fsm = result catch |err| switch (err) {
+        var fsm = result catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 const regex = pattern;
-                var message: std.ArrayList(u8) = .empty;
                 if (self.rule_name) |rule_name| {
                     error_mod.set_diag(diag, .{ .FsmBuild = try std.fmt.allocPrint(
                         gpa,
