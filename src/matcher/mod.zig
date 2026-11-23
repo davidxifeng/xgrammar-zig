@@ -20,6 +20,7 @@ pub const GrammarMatcher = grammar_matcher.GrammarMatcher;
 pub const free_captures = grammar_matcher.free_captures;
 // pub use token_bitmask::{...};
 pub const BitmaskDlType = token_bitmask.BitmaskDlType;
+pub const TokenBitmask = token_bitmask.TokenBitmask;
 pub const allocate_token_bitmask = token_bitmask.allocate_token_bitmask;
 pub const apply_token_bitmask_inplace_cpu = token_bitmask.apply_token_bitmask_inplace_cpu;
 pub const apply_token_bitmask_inplace_cpu_batch = token_bitmask.apply_token_bitmask_inplace_cpu_batch;

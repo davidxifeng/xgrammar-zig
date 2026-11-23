@@ -86,6 +86,11 @@ pub fn reset_recursion_depth() void {
     current_depth = 0;
 }
 
+/// Idiomatic Zig camelCase aliases.
+pub const getMaxRecursionDepth = get_max_recursion_depth;
+pub const setMaxRecursionDepth = set_max_recursion_depth;
+pub const resetRecursionDepth = reset_recursion_depth;
+
 /// RAII guard that increments the calling thread's recursion depth on creation and
 /// decrements it on drop (`deinit`).
 pub const RecursionGuard = struct {

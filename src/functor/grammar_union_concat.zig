@@ -84,20 +84,15 @@ pub fn add_sub_grammar(builder: *GrammarBuilder, sub: *const Grammar) Allocator.
         else
             try copy_expr(builder, sub, new_rule_ids.items, lookahead);
         builder.update_lookahead_assertion(new_rule_ids.items[i], new_lookahead);
-        remap_ids = new_rule_ids.items;
-        defer remap_ids = null;
-        try builder.copy_rule_attributes(new_rule_ids.items[i], sub, @intCast(i), remap_rule_id);
+        const remapper = struct {
+            ids: []const i32,
+            pub fn call(self: @This(), id: i32) i32 {
+                return self.ids[@intCast(id)];
+            }
+        }{ .ids = new_rule_ids.items };
+        try builder.copy_rule_attributes(new_rule_ids.items[i], sub, @intCast(i), remapper);
     }
     return new_rule_ids.items[@intCast(sub.root_rule_id)];
-}
-
-// The rule-id remapping closure for `copy_rule_attributes` (Zig has no closures; the
-// context slice is threaded through this module-local, valid only inside
-// `add_sub_grammar`).
-var remap_ids: ?[]const i32 = null;
-
-fn remap_rule_id(id: i32) i32 {
-    return remap_ids.?[@intCast(id)];
 }
 
 /// Re-adds an expression from `sub` into `builder`, remapping rule references through

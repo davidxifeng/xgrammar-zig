@@ -532,8 +532,14 @@ pub const GrammarBuilder = struct {
         if (source.suffix_stop_info(source_rule_id)) |info_src| {
             var info = try dupe_suffix_stop_info(self.allocator, info_src.*);
             if (info.body_rule_id >= 0) {
-                info.body_rule_id = map_rule_id(info.body_rule_id);
-                info.marker_rule_id = map_rule_id(info.marker_rule_id);
+                const MapT = @TypeOf(map_rule_id);
+                const apply_map = struct {
+                    inline fn call(m: MapT, id: i32) i32 {
+                        return if (@typeInfo(MapT) == .@"struct" and @hasDecl(MapT, "call")) m.call(id) else m(id);
+                    }
+                }.call;
+                info.body_rule_id = apply_map(map_rule_id, info.body_rule_id);
+                info.marker_rule_id = apply_map(map_rule_id, info.marker_rule_id);
             }
             try self.update_suffix_stop_info(rule_id, info);
         }

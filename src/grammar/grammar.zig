@@ -434,6 +434,37 @@ pub const Grammar = struct {
     pub fn byte_string(self: *const Grammar, allocator: Allocator, expr_id: i32) Allocator.Error![]u8 {
         return self.expr(expr_id).byte_string(allocator);
     }
+
+    // --- Idiomatic Zig 0.17 methods ---
+
+    pub fn numRules(self: *const Grammar) i32 {
+        return self.num_rules();
+    }
+
+    pub fn numExprs(self: *const Grammar) i32 {
+        return self.num_exprs();
+    }
+
+    pub fn rootRule(self: *const Grammar) Rule {
+        return self.root_rule();
+    }
+
+    pub fn isOptimized(self: *const Grammar) bool {
+        return self.is_optimized();
+    }
+
+    /// Renders this grammar to normalized EBNF text (`allocator`-owned slice).
+    pub fn toStringEbnf(self: *const Grammar, allocator: Allocator) Allocator.Error![]u8 {
+        return @import("printer.zig").to_string_ebnf(self, allocator);
+    }
+
+    /// Implements Zig 0.17 `{f}` formatting (`std.fmt.allocPrint(..., "{f}", .{grammar})`).
+    pub fn format(self: *const Grammar, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var arena = ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const text = self.toStringEbnf(arena.allocator()) catch return error.WriteFailed;
+        try writer.writeAll(text);
+    }
 };
 
 test "grammar from parts, clone and accessors" {

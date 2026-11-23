@@ -9,6 +9,8 @@ const MatcherError = error_mod.MatcherError;
 const MatcherErrorInfo = error_mod.MatcherErrorInfo;
 const grammar_matcher = @import("grammar_matcher.zig");
 const GrammarMatcher = grammar_matcher.GrammarMatcher;
+const token_bitmask_mod = @import("token_bitmask.zig");
+const TokenBitmask = token_bitmask_mod.TokenBitmask;
 
 fn check_batch_size(
     allocator: Allocator,
@@ -143,5 +145,33 @@ pub const BatchGrammarMatcher = struct {
             }
             temperatures[@intCast(position)] = matcher.temperature() orelse -1.0;
         }
+    }
+
+    // --- Idiomatic Zig 0.17 methods ---
+
+    pub fn fillBitmask(
+        allocator: Allocator,
+        matchers: []GrammarMatcher,
+        bitmask: *TokenBitmask,
+        indices: ?[]const i32,
+    ) MatcherError!void {
+        const s = bitmask.shape();
+        return batch_fill_next_token_bitmask(allocator, matchers, bitmask.words, &s, indices, null);
+    }
+
+    pub fn acceptTokens(
+        allocator: Allocator,
+        matchers: []GrammarMatcher,
+        token_ids: []const i32,
+    ) MatcherError![]bool {
+        return batch_accept_token(allocator, matchers, token_ids, null);
+    }
+
+    pub fn acceptStrings(
+        allocator: Allocator,
+        matchers: []GrammarMatcher,
+        inputs: []const []const u8,
+    ) MatcherError![]bool {
+        return batch_accept_string(allocator, matchers, inputs, null);
     }
 };

@@ -465,6 +465,10 @@ pub fn deserialize_cache_json_value(
 }
 
 /// Builds the adaptive token-mask cache for every scanable reachable FSM state.
+/// When `max_threads != 1` and there are at least 4 states to precompute, workers run in
+/// parallel across OS threads using private scratch arenas and synchronize only when
+/// transferring the compact `AdaptiveTokenMask` into `allocator`, inserting into `cache`
+/// in deterministic state order.
 pub fn build_adaptive_token_mask_cache(
     allocator: Allocator,
     grammar: *const Grammar,
@@ -472,7 +476,6 @@ pub fn build_adaptive_token_mask_cache(
     max_threads: i32,
     rl_cache: ?*RuleLevelCache,
 ) Allocator.Error!AdaptiveTokenMaskCache {
-    _ = max_threads; // rayon: parallel execution lands in Milestone 4
     var cache = AdaptiveTokenMaskCache.init(allocator);
     errdefer cache.deinit();
 
@@ -520,19 +523,131 @@ pub fn build_adaptive_token_mask_cache(
         return cache;
     }
 
-    for (tasks.items) |task| {
-        var matcher = try GrammarMatcherForTokenMaskCache.init(
-            allocator,
-            grammar,
-            task.state,
-            &tag_dispatch_bitsets,
-            tokenizer_info,
-            rl_cache,
-        );
-        defer matcher.deinit();
-        var mask = try matcher.get_adaptive_token_mask(task.is_root_rule);
-        errdefer mask.deinit();
-        try cache.put(task.state.cache_key(), mask);
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const requested: usize = if (max_threads <= 0) cpu_count else @intCast(max_threads);
+    const worker_total = if (max_threads == 1 or tasks.items.len < 4) 1 else @min(requested, tasks.items.len);
+
+    if (worker_total <= 1) {
+        for (tasks.items) |task| {
+            var matcher = try GrammarMatcherForTokenMaskCache.init(
+                allocator,
+                grammar,
+                task.state,
+                &tag_dispatch_bitsets,
+                tokenizer_info,
+                rl_cache,
+            );
+            defer matcher.deinit();
+            var mask = try matcher.get_adaptive_token_mask(task.is_root_rule);
+            errdefer mask.deinit();
+            try cache.put(task.state.cache_key(), mask);
+        }
+        return cache;
+    }
+
+    const results = try allocator.alloc(?AdaptiveTokenMask, tasks.items.len);
+    defer allocator.free(results);
+    @memset(results, null);
+    var transferred: usize = 0;
+    errdefer {
+        for (results[transferred..]) |*slot| {
+            if (slot.*) |*m| m.deinit();
+        }
+    }
+
+    const BitsetsType = @TypeOf(tag_dispatch_bitsets);
+    var local_alloc_mutex: std.atomic.Mutex = .unlocked;
+    const shared_alloc_mutex: *std.atomic.Mutex = if (rl_cache) |rlc| &rlc.alloc_mutex else &local_alloc_mutex;
+
+    const ParallelCtx = struct {
+        tasks: []const Task,
+        results: []?AdaptiveTokenMask,
+        grammar: *const Grammar,
+        tag_dispatch_bitsets: *const BitsetsType,
+        tokenizer_info: *const TokenizerInfo,
+        rl_cache: ?*RuleLevelCache,
+        out_allocator: Allocator,
+        alloc_mutex: *std.atomic.Mutex,
+        next_idx: std.atomic.Value(usize),
+        had_oom: std.atomic.Value(bool),
+
+        fn run(ctx: *@This()) void {
+            var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch_arena.deinit();
+            const scratch = scratch_arena.allocator();
+
+            while (!ctx.had_oom.load(.acquire)) {
+                const idx = ctx.next_idx.fetchAdd(1, .monotonic);
+                if (idx >= ctx.tasks.len) break;
+                defer _ = scratch_arena.reset(.retain_capacity);
+
+                const task = ctx.tasks[idx];
+                var matcher = GrammarMatcherForTokenMaskCache.init(
+                    scratch,
+                    ctx.grammar,
+                    task.state,
+                    ctx.tag_dispatch_bitsets,
+                    ctx.tokenizer_info,
+                    ctx.rl_cache,
+                ) catch {
+                    ctx.had_oom.store(true, .release);
+                    break;
+                };
+                // `matcher` borrows `scratch`; arena reset frees its intermediates cleanly.
+                const tmp_mask = matcher.get_adaptive_token_mask(task.is_root_rule) catch {
+                    ctx.had_oom.store(true, .release);
+                    break;
+                };
+
+                while (!ctx.alloc_mutex.tryLock()) {
+                    std.atomic.spinLoopHint();
+                }
+                defer ctx.alloc_mutex.unlock();
+                ctx.results[idx] = tmp_mask.clone(ctx.out_allocator) catch {
+                    ctx.had_oom.store(true, .release);
+                    break;
+                };
+            }
+        }
+    };
+
+    var ctx = ParallelCtx{
+        .tasks = tasks.items,
+        .results = results,
+        .grammar = grammar,
+        .tag_dispatch_bitsets = &tag_dispatch_bitsets,
+        .tokenizer_info = tokenizer_info,
+        .rl_cache = rl_cache,
+        .out_allocator = allocator,
+        .alloc_mutex = shared_alloc_mutex,
+        .next_idx = std.atomic.Value(usize).init(0),
+        .had_oom = std.atomic.Value(bool).init(false),
+    };
+
+    const extra_threads = worker_total - 1;
+    const threads = try allocator.alloc(?std.Thread, extra_threads);
+    defer allocator.free(threads);
+    @memset(threads, null);
+
+    for (threads) |*slot| {
+        slot.* = std.Thread.spawn(.{}, ParallelCtx.run, .{&ctx}) catch null;
+    }
+    ParallelCtx.run(&ctx);
+    for (threads) |slot| {
+        if (slot) |t| t.join();
+    }
+
+    if (ctx.had_oom.load(.acquire)) {
+        return error.OutOfMemory;
+    }
+
+    for (tasks.items, 0..) |task, idx| {
+        const mask = results[idx] orelse unreachable;
+        results[idx] = null;
+        transferred = idx + 1;
+        var owned_mask = mask;
+        errdefer owned_mask.deinit();
+        try cache.put(task.state.cache_key(), owned_mask);
     }
 
     return cache;

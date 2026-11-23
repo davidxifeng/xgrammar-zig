@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const adaptive_token_mask = @import("adaptive_token_mask.zig");
 const AdaptiveTokenMask = adaptive_token_mask.AdaptiveTokenMask;
 const support = @import("../support/mod.zig");
+const AutoLruCache = support.AutoLruCache;
 const hash_combine = support.hash_combine;
 
 /// Unlimited cache size sentinel (matches C++ `kUnlimitedSize`).
@@ -22,37 +23,43 @@ const NodeKey = struct {
     edge_cnt: i32,
 };
 
-/// One shard of the cache, with its own LRU order and memory budget.
+fn lockMutex(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// One shard of the cache, with its own O(1) LRU order and memory budget.
 const CacheState = struct {
     allocator: Allocator,
     max_cache_memory_size: usize,
     current_cache_memory_size: i64,
-    order: std.ArrayList(NodeKey),
-    cache: std.AutoHashMapUnmanaged(NodeKey, AdaptiveTokenMask),
+    lru: AutoLruCache(NodeKey, AdaptiveTokenMask),
 
     fn init(allocator: Allocator, max_cache_memory_size: usize) CacheState {
         return .{
             .allocator = allocator,
             .max_cache_memory_size = max_cache_memory_size,
             .current_cache_memory_size = 0,
-            .order = .empty,
-            .cache = .empty,
+            .lru = AutoLruCache(NodeKey, AdaptiveTokenMask).init(),
         };
     }
 
-    fn deinit(self: *CacheState) void {
-        self.clear();
-        self.order.deinit(self.allocator);
-        self.cache.deinit(self.allocator);
+    fn deinit(self: *CacheState, alloc_mutex: *std.atomic.Mutex) void {
+        self.clear(alloc_mutex);
+        lockMutex(alloc_mutex);
+        defer alloc_mutex.unlock();
+        self.lru.deinit(self.allocator);
     }
 
-    fn clear(self: *CacheState) void {
-        var it = self.cache.valueIterator();
-        while (it.next()) |mask| {
+    fn clear(self: *CacheState, alloc_mutex: *std.atomic.Mutex) void {
+        lockMutex(alloc_mutex);
+        defer alloc_mutex.unlock();
+        while (self.lru.popLru()) |entry| {
+            var mask = entry.value;
             mask.deinit();
         }
-        self.cache.clearRetainingCapacity();
-        self.order.clearRetainingCapacity();
+        self.lru.clearRetainingCapacity();
         self.current_cache_memory_size = 0;
     }
 
@@ -70,20 +77,13 @@ const CacheState = struct {
             .state_cnt = state_cnt,
             .edge_cnt = edge_cnt,
         };
-        const mask = self.cache.getPtr(key) orelse return null;
-        const cloned = try mask.clone(out_allocator);
-        for (self.order.items, 0..) |entry, pos| {
-            if (std.meta.eql(entry, key)) {
-                const moved = self.order.orderedRemove(pos);
-                self.order.appendAssumeCapacity(moved);
-                break;
-            }
-        }
-        return cloned;
+        const mask = self.lru.getPtr(key) orelse return null;
+        return try mask.clone(out_allocator);
     }
 
     fn add(
         self: *CacheState,
+        alloc_mutex: *std.atomic.Mutex,
         fsm_hash: u64,
         fsm_new_node_id: i32,
         state_cnt: i32,
@@ -96,34 +96,36 @@ const CacheState = struct {
             .state_cnt = state_cnt,
             .edge_cnt = edge_cnt,
         };
-        if (self.max_cache_memory_size != UNLIMITED_SIZE and token_mask.memory_size_bytes() > self.max_cache_memory_size) {
+        const new_item_size = token_mask.memory_size_bytes();
+        if (self.max_cache_memory_size != UNLIMITED_SIZE and new_item_size > self.max_cache_memory_size) {
             return false;
         }
-        if (self.cache.contains(key)) {
+        if (self.lru.contains(key)) {
             return false;
         }
 
+        lockMutex(alloc_mutex);
+        defer alloc_mutex.unlock();
+
         if (self.max_cache_memory_size != UNLIMITED_SIZE) {
-            const new_item_size = token_mask.memory_size_bytes();
             while (@as(i128, self.current_cache_memory_size) >
                 @as(i128, self.max_cache_memory_size) - @as(i128, new_item_size))
             {
-                if (self.order.items.len == 0) break;
-                const oldest = self.order.orderedRemove(0);
-                if (self.cache.fetchRemove(oldest)) |removed| {
-                    var removed_mask = removed.value;
-                    self.current_cache_memory_size -= @as(i64, @intCast(removed_mask.memory_size_bytes()));
-                    removed_mask.deinit();
-                }
+                const oldest = self.lru.popLru() orelse break;
+                var removed_mask = oldest.value;
+                self.current_cache_memory_size -= @as(i64, @intCast(removed_mask.memory_size_bytes()));
+                removed_mask.deinit();
             }
         }
 
         var stored = try token_mask.clone(self.allocator);
         errdefer stored.deinit();
-        try self.order.ensureUnusedCapacity(self.allocator, 1);
-        try self.cache.put(self.allocator, key, stored);
-        self.order.appendAssumeCapacity(key);
-        self.current_cache_memory_size += @as(i64, @intCast(stored.memory_size_bytes()));
+        if (try self.lru.put(self.allocator, key, stored)) |prev| {
+            var prev_mask = prev.value;
+            self.current_cache_memory_size -= @as(i64, @intCast(prev_mask.memory_size_bytes()));
+            prev_mask.deinit();
+        }
+        self.current_cache_memory_size += @as(i64, @intCast(new_item_size));
         return true;
     }
 };
@@ -133,9 +135,7 @@ const Shard = struct {
     state: CacheState,
 
     fn lock(self: *Shard) void {
-        while (!self.mutex.tryLock()) {
-            std.atomic.spinLoopHint();
-        }
+        lockMutex(&self.mutex);
     }
 
     fn unlock(self: *Shard) void {
@@ -148,6 +148,7 @@ const Shard = struct {
 /// memory budget.
 pub const RuleLevelCache = struct {
     allocator: Allocator,
+    alloc_mutex: std.atomic.Mutex,
     shards: [NUM_SHARDS]Shard,
     max_cache_memory_size: usize,
 
@@ -159,6 +160,7 @@ pub const RuleLevelCache = struct {
             max_cache_memory_size / NUM_SHARDS;
         const self = try allocator.create(RuleLevelCache);
         self.allocator = allocator;
+        self.alloc_mutex = .unlocked;
         self.max_cache_memory_size = max_cache_memory_size;
         for (&self.shards) |*s| {
             s.* = .{
@@ -172,7 +174,7 @@ pub const RuleLevelCache = struct {
     pub fn deinit(self: *RuleLevelCache) void {
         const a = self.allocator;
         for (&self.shards) |*s| {
-            s.state.deinit();
+            s.state.deinit(&self.alloc_mutex);
         }
         a.destroy(self);
     }
@@ -211,7 +213,7 @@ pub const RuleLevelCache = struct {
         const s = self.shard_for(fsm_hash, fsm_new_node_id);
         s.lock();
         defer s.unlock();
-        return s.state.add(fsm_hash, fsm_new_node_id, state_cnt, edge_cnt, token_mask);
+        return s.state.add(&self.alloc_mutex, fsm_hash, fsm_new_node_id, state_cnt, edge_cnt, token_mask);
     }
 
     /// Clears all cached entries.
@@ -219,7 +221,7 @@ pub const RuleLevelCache = struct {
         for (&self.shards) |*s| {
             s.lock();
             defer s.unlock();
-            s.state.clear();
+            s.state.clear(&self.alloc_mutex);
         }
     }
 

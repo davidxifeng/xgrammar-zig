@@ -106,6 +106,31 @@ pub const TokenizerInfo = struct {
         };
     }
 
+    pub const InitOptions = struct {
+        vocab_type: VocabType = .Raw,
+        vocab_size: ?i32 = null,
+        stop_token_ids: ?[]const i32 = null,
+        add_prefix_space: bool = false,
+        diag: ?*TokenizerErrorInfo = null,
+    };
+
+    /// Idiomatic Zig 0.17 constructor with defaulted `InitOptions`.
+    pub fn init(
+        allocator: Allocator,
+        encoded_vocab: []const []const u8,
+        options: InitOptions,
+    ) TokenizerError!TokenizerInfo {
+        return new(
+            allocator,
+            encoded_vocab,
+            options.vocab_type,
+            options.vocab_size,
+            options.stop_token_ids,
+            options.add_prefix_space,
+            options.diag,
+        );
+    }
+
     /// Constructs the tokenizer info.
     ///
     /// `encoded_vocab` is the encoded vocabulary of the tokenizer.
@@ -327,6 +352,39 @@ pub const TokenizerInfo = struct {
     /// Caller owns the returned memory.
     pub fn dump_metadata(self: *TokenizerInfo, allocator: Allocator) error{OutOfMemory}![]u8 {
         return json_stringify(allocator, metadata_value_into(self.arena.allocator(), self) catch return error.OutOfMemory);
+    }
+
+    // --- Idiomatic Zig 0.17 accessors ---
+
+    pub fn vocabSize(self: *const TokenizerInfo) i32 {
+        return self.vocab_size;
+    }
+
+    pub fn vocabType(self: *const TokenizerInfo) VocabType {
+        return self.vocab_type;
+    }
+
+    pub fn addPrefixSpace(self: *const TokenizerInfo) bool {
+        return self.add_prefix_space;
+    }
+
+    pub fn decodedVocab(self: *const TokenizerInfo) []const []const u8 {
+        return self.decoded_vocab;
+    }
+
+    pub fn stopTokenIds(self: *const TokenizerInfo) []const i32 {
+        return self.stop_token_ids;
+    }
+
+    pub fn specialTokenIds(self: *const TokenizerInfo) []const i32 {
+        return self.special_token_ids;
+    }
+
+    pub fn dumpMetadata(self: *const TokenizerInfo, allocator: Allocator) error{OutOfMemory}![]u8 {
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const val = try metadata_value_into(scratch.allocator(), self);
+        return std.json.Stringify.valueAlloc(allocator, val, .{});
     }
 
     /// Returns tokenizer metadata as a JSON object (serde_json key order: sorted).

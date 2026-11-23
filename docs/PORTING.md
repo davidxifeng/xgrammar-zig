@@ -273,3 +273,16 @@
 3. **Oracle CLI 与全量对拍 (`tools/oracle.zig`)**:
    - 在 `build.zig` 中接入 `xgrammar-oracle` 可执行产物,完整对齐 `tools/oracle-rs/src/main.rs` JSON 输入输出协议(含多字位掩码、`json_schema`/`ebnf`、`byte_fallback`/`raw` 词表、`add_prefix_space`、`vocab_size` padding 与 Unicode `from_utf8_lossy` 最大子串替换)。
    - `xgrammar-oracle` 与 Rust `oracle` 在 5 组跨场景全序列上达到 100% 一致;黄金用例已固化至 `src/oracle_parity_test.zig`。
+
+## 10. Milestone 4 补充(Zig 0.17 惯用 API、O(1) LRU、多线程编译与 SIMD Bitmask)
+
+1. **线程安全与可重入清理**:
+   - 移除 `src/functor/grammar_union_concat.zig` 中的模块全局 `remap_ids` 闭包状态,`GrammarBuilder.copy_rule_attributes` 支持带 `pub fn call` 的栈上闭包结构体。
+   - `RuleLevelCache` 增加跨 shard 分配互斥保护,确保并发编译在任意宿主 `Allocator` 下均无数据竞争。
+2. **O(1) 侵入式 LRU 缓存 (`src/support/lru_cache.zig`)**:
+   - 新增基于数组双链表索引 + 空闲链表的通用 `LruCache`/`AutoLruCache`,替换 `RuleLevelCache` 与 `GrammarCompiler` 中的线性 `orderedRemove` 移位。
+3. **多线程 `build_adaptive_token_mask_cache`**:
+   - 在 `max_threads != 1` 且待计算状态数 >= 4 时,利用 `std.Thread.spawn` 配合每线程私有 `ArenaAllocator` 并行计算,主线程按确定性状态序回填,与单线程结果逐字节一致。
+4. **SIMD `TokenBitmask` 与 Zig 0.17 惯用表面 API**:
+   - `apply_token_bitmask_inplace_cpu(_batch)` 与 `TokenBitmask` 采用 `@Vector(8, f32)` + 全 1/全 0 字快速路径及 `@popCount`/`@ctz` 位计数。
+   - 为 `Grammar`(`{f}` `format`)、`TokenizerInfo`、`GrammarCompiler`、`CompiledGrammar`、`GrammarMatcher`、`BatchGrammarMatcher` 与根 `xgrammar` 增补 `camelCase` + 默认选项结构 API,保留全部已有 `snake_case` 契约不变。

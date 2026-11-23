@@ -159,4 +159,5 @@ test "testing print_grammar_fsms and is_rule_fsm_accept_string" {
 
 test {
     _ = @import("oracle_parity_test.zig");
+    _ = @import("idiomatic_api_test.zig");
 }

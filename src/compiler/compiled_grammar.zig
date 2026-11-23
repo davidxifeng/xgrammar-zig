@@ -76,6 +76,8 @@ pub const CompiledGrammar = struct {
         return self.shared == other.shared;
     }
 
+    pub const sharesStorage = shares_storage;
+
     /// Gets the associated grammar.
     pub fn grammar(self: *const CompiledGrammar) *const Grammar {
         return self.shared.grammar;
@@ -86,10 +88,14 @@ pub const CompiledGrammar = struct {
         return &self.shared.tokenizer_info;
     }
 
+    pub const tokenizerInfo = tokenizer_info;
+
     /// Gets the precomputed adaptive token-mask cache.
     pub fn adaptive_token_mask_cache(self: *const CompiledGrammar) *const AdaptiveTokenMaskCache {
         return &self.shared.adaptive_token_mask_cache;
     }
+
+    pub const adaptiveTokenMaskCache = adaptive_token_mask_cache;
 
     /// Builds a compiled grammar, including the adaptive token-mask cache.
     /// Takes ownership of `grammar_ptr` on success; clones `tokenizer` into the compiled grammar.
@@ -127,6 +133,8 @@ pub const CompiledGrammar = struct {
         return exprs + rules + vocab + cache;
     }
 
+    pub const memorySizeBytes = memory_size_bytes;
+
     /// Returns the serialized JSON string of the compiled grammar (caller owns).
     pub fn serialize_json(self: *const CompiledGrammar, allocator: Allocator) Allocator.Error![]u8 {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -134,6 +142,8 @@ pub const CompiledGrammar = struct {
         const val = try self.serialize_json_value(arena.allocator());
         return std.json.Stringify.valueAlloc(allocator, val, .{});
     }
+
+    pub const serializeJson = serialize_json;
 
     /// Serializes the compiled grammar to a JSON value inside `arena_allocator`.
     /// Keys are inserted in lexicographic order to match serde_json's BTreeMap order.
@@ -168,6 +178,14 @@ pub const CompiledGrammar = struct {
             },
         };
         return CompiledGrammar.deserialize_json_value(allocator, value, tokenizer, diag);
+    }
+
+    pub fn deserializeJson(
+        allocator: Allocator,
+        json_str: []const u8,
+        tokenizer: *const TokenizerInfo,
+    ) DeserializeErrorAll!CompiledGrammar {
+        return deserialize_json(allocator, json_str, tokenizer, null);
     }
 
     /// Deserializes a compiled grammar from a JSON value.

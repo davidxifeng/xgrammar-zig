@@ -12,6 +12,7 @@ const error_mod = @import("error.zig");
 const MatcherError = error_mod.MatcherError;
 const MatcherErrorInfo = error_mod.MatcherErrorInfo;
 const token_bitmask_mod = @import("token_bitmask.zig");
+const TokenBitmask = token_bitmask_mod.TokenBitmask;
 const bitmask_row_range = token_bitmask_mod.bitmask_row_range;
 const get_bitmask_size = token_bitmask_mod.get_bitmask_size;
 
@@ -196,6 +197,29 @@ pub const GrammarMatcher = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => unreachable,
         };
+    }
+
+    pub const InitOptions = struct {
+        override_stop_tokens: ?[]const i32 = null,
+        terminate_without_stop_token: bool = false,
+        default_temperature: ?f32 = null,
+        diag: ?*MatcherErrorInfo = null,
+    };
+
+    /// Idiomatic Zig 0.17 constructor with defaulted `InitOptions`.
+    pub fn init(
+        allocator: Allocator,
+        compiled: *const CompiledGrammar,
+        options: InitOptions,
+    ) MatcherError!GrammarMatcher {
+        return with_options(
+            allocator,
+            compiled,
+            options.override_stop_tokens,
+            options.terminate_without_stop_token,
+            options.default_temperature,
+            options.diag,
+        );
     }
 
     /// Constructs a matcher with an optional stop-token override and a default sampling
@@ -421,6 +445,49 @@ pub const GrammarMatcher = struct {
 
     pub fn max_rollback_tokens(_: *const GrammarMatcher) i32 {
         return -1;
+    }
+
+    // --- Idiomatic Zig 0.17 methods ---
+
+    pub fn acceptToken(self: *GrammarMatcher, token_id: i32) Allocator.Error!bool {
+        return self.accept_token(token_id);
+    }
+
+    pub fn acceptString(self: *GrammarMatcher, input: []const u8) Allocator.Error!bool {
+        return self.accept_string(input);
+    }
+
+    pub fn acceptBytes(self: *GrammarMatcher, input: []const u8) Allocator.Error!bool {
+        return self.accept_bytes(input);
+    }
+
+    pub fn fillBitmask(self: *GrammarMatcher, bitmask: *TokenBitmask) MatcherError!bool {
+        return self.fillBitmaskRow(bitmask, 0);
+    }
+
+    pub fn fillBitmaskRow(self: *GrammarMatcher, bitmask: *TokenBitmask, row: usize) MatcherError!bool {
+        const s = bitmask.shape();
+        return self.fill_next_token_bitmask(bitmask.words, &s, @intCast(row), null);
+    }
+
+    pub fn findJumpForwardString(self: *GrammarMatcher, allocator: Allocator) MatcherError![]u8 {
+        return self.find_jump_forward_string(allocator, null);
+    }
+
+    pub fn isCompleted(self: *const GrammarMatcher) bool {
+        return self.is_completed();
+    }
+
+    pub fn isTerminated(self: *const GrammarMatcher) bool {
+        return self.is_terminated();
+    }
+
+    pub fn stopTokenIds(self: *const GrammarMatcher) []const i32 {
+        return self.get_stop_token_ids();
+    }
+
+    pub fn getCaptures(self: *const GrammarMatcher, allocator: Allocator, deduplicate: bool) Allocator.Error![]Capture {
+        return self.get_captures(allocator, deduplicate);
     }
 
     /// Human-readable dump of the latest parser states (caller owns).

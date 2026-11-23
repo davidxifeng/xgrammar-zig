@@ -13,6 +13,7 @@ const encoding_mod = @import("encoding.zig");
 const hash_mod = @import("hash.zig");
 const int_set_mod = @import("int_set.zig");
 const json_parse_mod = @import("json_parse.zig");
+const lru_cache_mod = @import("lru_cache.zig");
 const recursion_guard_mod = @import("recursion_guard.zig");
 const union_find_set_mod = @import("union_find_set.zig");
 
@@ -23,6 +24,7 @@ pub const encoding = encoding_mod;
 pub const hash = hash_mod;
 pub const int_set = int_set_mod;
 pub const json_parse = json_parse_mod;
+pub const lru_cache = lru_cache_mod;
 pub const recursion_guard = recursion_guard_mod;
 pub const union_find_set = union_find_set_mod;
 
@@ -60,6 +62,9 @@ pub const intset_intersection = int_set.intset_intersection;
 pub const intset_union = int_set.intset_union;
 // pub use json_parse::parse_json;
 pub const parse_json = json_parse.parse_json;
+// O(1) generic LRU cache
+pub const AutoLruCache = lru_cache.AutoLruCache;
+pub const LruCache = lru_cache.LruCache;
 // pub use recursion_guard::{...};
 pub const DEFAULT_MAX_RECURSION_DEPTH = recursion_guard.DEFAULT_MAX_RECURSION_DEPTH;
 pub const MAX_REASONABLE_RECURSION_DEPTH = recursion_guard.MAX_REASONABLE_RECURSION_DEPTH;
@@ -68,6 +73,9 @@ pub const RecursionGuard = recursion_guard.RecursionGuard;
 pub const get_max_recursion_depth = recursion_guard.get_max_recursion_depth;
 pub const reset_recursion_depth = recursion_guard.reset_recursion_depth;
 pub const set_max_recursion_depth = recursion_guard.set_max_recursion_depth;
+pub const getMaxRecursionDepth = recursion_guard.getMaxRecursionDepth;
+pub const resetRecursionDepth = recursion_guard.resetRecursionDepth;
+pub const setMaxRecursionDepth = recursion_guard.setMaxRecursionDepth;
 // pub use union_find_set::UnionFindSet;
 pub const UnionFindSet = union_find_set.UnionFindSet;
 
@@ -79,6 +87,7 @@ test {
     _ = hash_mod;
     _ = int_set_mod;
     _ = json_parse_mod;
+    _ = lru_cache_mod;
     _ = recursion_guard_mod;
     _ = union_find_set_mod;
 }

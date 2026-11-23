@@ -17,6 +17,7 @@ const functor = @import("../functor/mod.zig");
 const grammar_mod = @import("../grammar/mod.zig");
 const Grammar = grammar_mod.Grammar;
 const parser_mod = @import("../parser/mod.zig");
+const support = @import("../support/mod.zig");
 const tokenizer_mod = @import("../tokenizer/mod.zig");
 const TokenizerInfo = tokenizer_mod.tokenizer_info.TokenizerInfo;
 
@@ -25,46 +26,34 @@ const UNLIMITED: i64 = -1;
 
 const CacheState = struct {
     allocator: Allocator,
-    map: std.StringHashMapUnmanaged(CompiledGrammar),
-    /// Front = least recently used; back = most recently used. Keys point to the slices owned by `map`.
-    order: std.ArrayList([]const u8),
+    lru: support.LruCache([]const u8, CompiledGrammar, std.hash_map.StringContext),
     size_bytes: i64,
 
     fn init(allocator: Allocator) CacheState {
         return .{
             .allocator = allocator,
-            .map = .empty,
-            .order = .empty,
+            .lru = support.LruCache([]const u8, CompiledGrammar, std.hash_map.StringContext).init(),
             .size_bytes = 0,
         };
     }
 
     fn deinit(self: *CacheState) void {
         self.clear();
-        self.map.deinit(self.allocator);
-        self.order.deinit(self.allocator);
+        self.lru.deinit(self.allocator);
     }
 
     fn clear(self: *CacheState) void {
-        var it = self.map.iterator();
-        while (it.next()) |kv| {
-            self.allocator.free(kv.key_ptr.*);
-            kv.value_ptr.deinit();
+        while (self.lru.popLru()) |entry| {
+            self.allocator.free(entry.key);
+            var val = entry.value;
+            val.deinit();
         }
-        self.map.clearRetainingCapacity();
-        self.order.clearRetainingCapacity();
+        self.lru.clearRetainingCapacity();
         self.size_bytes = 0;
     }
 
     fn get(self: *CacheState, key: []const u8) ?CompiledGrammar {
-        const val = self.map.getPtr(key) orelse return null;
-        for (self.order.items, 0..) |k, pos| {
-            if (std.mem.eql(u8, k, key)) {
-                const moved = self.order.orderedRemove(pos);
-                self.order.appendAssumeCapacity(moved);
-                break;
-            }
-        }
+        const val = self.lru.getPtr(key) orelse return null;
         return val.clone();
     }
 
@@ -81,21 +70,13 @@ const CacheState = struct {
             value.deinit();
         }
         const entry_size: i64 = @intCast(value.memory_size_bytes());
-        if (self.map.fetchRemove(key_owned)) |old| {
+        if (self.lru.remove(key_owned)) |old| {
             var old_val = old.value;
             self.size_bytes -= @as(i64, @intCast(old_val.memory_size_bytes()));
-            for (self.order.items, 0..) |k, pos| {
-                if (std.mem.eql(u8, k, key_owned)) {
-                    _ = self.order.orderedRemove(pos);
-                    break;
-                }
-            }
             old_val.deinit();
             self.allocator.free(old.key);
         }
-        try self.order.ensureUnusedCapacity(self.allocator, 1);
-        try self.map.put(self.allocator, key_owned, value);
-        self.order.appendAssumeCapacity(key_owned);
+        _ = try self.lru.put(self.allocator, key_owned, value);
         self.size_bytes += entry_size;
         if (self.size_bytes < 0) self.size_bytes = 0;
         self.evict_to_limit(max_memory_bytes);
@@ -104,14 +85,11 @@ const CacheState = struct {
     fn evict_to_limit(self: *CacheState, max_memory_bytes: i64) void {
         if (max_memory_bytes < 0) return;
         while (self.size_bytes > max_memory_bytes) {
-            if (self.order.items.len == 0) break;
-            const oldest_key = self.order.orderedRemove(0);
-            if (self.map.fetchRemove(oldest_key)) |removed| {
-                var removed_val = removed.value;
-                self.size_bytes -= @as(i64, @intCast(removed_val.memory_size_bytes()));
-                removed_val.deinit();
-                self.allocator.free(removed.key);
-            }
+            const oldest = self.lru.popLru() orelse break;
+            var removed_val = oldest.value;
+            self.size_bytes -= @as(i64, @intCast(removed_val.memory_size_bytes()));
+            removed_val.deinit();
+            self.allocator.free(oldest.key);
         }
         if (self.size_bytes < 0) self.size_bytes = 0;
     }
@@ -545,6 +523,78 @@ pub const GrammarCompiler = struct {
     pub fn get_max_threads(self: *const GrammarCompiler) i32 {
         return self.max_threads;
     }
+
+    // --- Idiomatic Zig 0.17 options & methods ---
+
+    pub const InitOptions = struct {
+        max_threads: i32 = 8,
+        cache_enabled: bool = true,
+        max_memory_bytes: ?usize = null,
+    };
+
+    pub const JsonSchemaOptions = struct {
+        any_whitespace: bool = true,
+        indent: ?i32 = null,
+        separators: ?converter.Separators = null,
+        strict_mode: bool = true,
+        max_whitespace_cnt: ?i32 = null,
+        any_order: bool = false,
+        diag: ?*CompileErrorInfo = null,
+    };
+
+    pub fn init(
+        allocator: Allocator,
+        tokenizer: *const TokenizerInfo,
+        options: InitOptions,
+    ) Allocator.Error!*GrammarCompiler {
+        const limit: i64 = if (options.max_memory_bytes) |bytes| @intCast(bytes) else UNLIMITED;
+        return new(allocator, tokenizer, options.max_threads, options.cache_enabled, limit);
+    }
+
+    pub fn compileGrammar(self: *GrammarCompiler, grammar: *const Grammar) CompileError!CompiledGrammar {
+        return self.compile_grammar(grammar, null);
+    }
+
+    pub fn compileEbnf(self: *GrammarCompiler, ebnf_str: []const u8, root_rule_name: []const u8) CompileError!CompiledGrammar {
+        return self.compile_grammar_ebnf(ebnf_str, root_rule_name, null);
+    }
+
+    pub fn compileBuiltinJson(self: *GrammarCompiler) Allocator.Error!CompiledGrammar {
+        return self.compile_builtin_json_grammar();
+    }
+
+    pub fn compileJsonSchema(
+        self: *GrammarCompiler,
+        schema: []const u8,
+        options: JsonSchemaOptions,
+    ) CompileError!CompiledGrammar {
+        return self.compile_json_schema_with_any_order(
+            schema,
+            options.any_whitespace,
+            options.indent,
+            options.separators,
+            options.strict_mode,
+            options.max_whitespace_cnt,
+            options.any_order,
+            options.diag,
+        );
+    }
+
+    pub fn compileRegex(self: *GrammarCompiler, regex_str: []const u8) CompileError!CompiledGrammar {
+        return self.compile_regex(regex_str, null);
+    }
+
+    pub fn compileLark(self: *GrammarCompiler, lark_str: []const u8, named_grammars: []const converter.NamedGrammar) CompileError!CompiledGrammar {
+        return self.compile_lark(lark_str, named_grammars, null);
+    }
+
+    pub fn compileStructuralTag(self: *GrammarCompiler, structural_tag_json: []const u8) CompileError!CompiledGrammar {
+        return self.compile_structural_tag(structural_tag_json, null);
+    }
+
+    pub const clearCache = clear_cache;
+    pub const getCacheSizeBytes = get_cache_size_bytes;
+    pub const cacheLimitBytes = cache_limit_bytes;
 
     fn try_cache_get(self: *GrammarCompiler, key: []const u8) ?CompiledGrammar {
         if (!self.cache_enabled) return null;

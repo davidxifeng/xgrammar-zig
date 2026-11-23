@@ -133,28 +133,195 @@ pub fn get_masked_tokens_from_bitmask(
     return out.toOwnedSlice(allocator);
 }
 
+/// First-class managed or borrowed token bitmask with SIMD logit masking and fast bit queries.
+pub const TokenBitmask = struct {
+    words: []i32,
+    batch_size: usize,
+    vocab_size: usize,
+    words_per_row: usize,
+    owned_allocator: ?Allocator = null,
+
+    /// Allocates an owned single-row bitmask with all tokens allowed.
+    pub fn init(allocator: Allocator, vocab_size: usize) Allocator.Error!TokenBitmask {
+        return initBatch(allocator, 1, vocab_size);
+    }
+
+    /// Allocates an owned batched bitmask (`batch_size * ceil(vocab_size / 32)` words), initialized to all-ones.
+    pub fn initBatch(allocator: Allocator, batch_size: usize, vocab_size: usize) Allocator.Error!TokenBitmask {
+        const wpr: usize = @intCast(get_bitmask_size(@intCast(vocab_size)));
+        const words = try allocator.alloc(i32, batch_size * wpr);
+        @memset(words, -1);
+        return .{
+            .words = words,
+            .batch_size = batch_size,
+            .vocab_size = vocab_size,
+            .words_per_row = wpr,
+            .owned_allocator = allocator,
+        };
+    }
+
+    /// Wraps a caller-owned bitmask buffer without taking ownership.
+    pub fn fromSlice(words: []i32, batch_size: usize, vocab_size: usize) MatcherError!TokenBitmask {
+        const wpr: usize = @intCast(get_bitmask_size(@intCast(vocab_size)));
+        if (words.len < batch_size * wpr) return error.InvalidArgument;
+        return .{
+            .words = words[0 .. batch_size * wpr],
+            .batch_size = batch_size,
+            .vocab_size = vocab_size,
+            .words_per_row = wpr,
+            .owned_allocator = null,
+        };
+    }
+
+    pub fn deinit(self: *TokenBitmask) void {
+        if (self.owned_allocator) |a| {
+            a.free(self.words);
+        }
+        self.* = undefined;
+    }
+
+    pub fn shape(self: TokenBitmask) [2]i64 {
+        return .{ @intCast(self.batch_size), @intCast(self.words_per_row) };
+    }
+
+    pub fn reset(self: *TokenBitmask) void {
+        @memset(self.words, -1);
+    }
+
+    pub fn resetRow(self: *TokenBitmask, row: usize) void {
+        std.debug.assert(row < self.batch_size);
+        @memset(self.rowWordsMut(row), -1);
+    }
+
+    pub fn rowWords(self: TokenBitmask, row: usize) []const i32 {
+        std.debug.assert(row < self.batch_size);
+        const start = row * self.words_per_row;
+        return self.words[start .. start + self.words_per_row];
+    }
+
+    pub fn rowWordsMut(self: *TokenBitmask, row: usize) []i32 {
+        std.debug.assert(row < self.batch_size);
+        const start = row * self.words_per_row;
+        return self.words[start .. start + self.words_per_row];
+    }
+
+    pub fn isAllowed(self: TokenBitmask, token_id: usize) bool {
+        return self.isAllowedInRow(0, token_id);
+    }
+
+    pub fn isAllowedInRow(self: TokenBitmask, row: usize, token_id: usize) bool {
+        if (token_id >= self.vocab_size) return false;
+        return bit_is_set(self.rowWords(row), @intCast(token_id));
+    }
+
+    pub fn setAllowed(self: *TokenBitmask, token_id: usize, allowed: bool) void {
+        self.setAllowedInRow(0, token_id, allowed);
+    }
+
+    pub fn setAllowedInRow(self: *TokenBitmask, row: usize, token_id: usize, allowed: bool) void {
+        std.debug.assert(token_id < self.vocab_size);
+        const rw = self.rowWordsMut(row);
+        const word_idx = token_id / 32;
+        const bit_idx: u5 = @intCast(token_id % 32);
+        const bit_mask: u32 = @as(u32, 1) << bit_idx;
+        var u: u32 = @bitCast(rw[word_idx]);
+        if (allowed) {
+            u |= bit_mask;
+        } else {
+            u &= ~bit_mask;
+        }
+        rw[word_idx] = @bitCast(u);
+    }
+
+    pub fn countAllowed(self: TokenBitmask) usize {
+        return self.countAllowedInRow(0);
+    }
+
+    pub fn countAllowedInRow(self: TokenBitmask, row: usize) usize {
+        return count_allowed_bits(self.rowWords(row), self.vocab_size);
+    }
+
+    pub fn singleAllowedToken(self: TokenBitmask) ?u32 {
+        return self.singleAllowedTokenInRow(0);
+    }
+
+    pub fn singleAllowedTokenInRow(self: TokenBitmask, row: usize) ?u32 {
+        const res = single_token_in_row(self.rowWords(row), self.vocab_size);
+        return if (res.is_single) @intCast(res.token_id) else null;
+    }
+
+    pub fn applyToLogits(self: TokenBitmask, logits: []f32) void {
+        self.applyRowToLogits(0, logits);
+    }
+
+    pub fn applyRowToLogits(self: TokenBitmask, row: usize, logits: []f32) void {
+        std.debug.assert(logits.len >= self.vocab_size);
+        apply_simd_mask(logits[0..self.vocab_size], self.rowWords(row), self.vocab_size);
+    }
+
+    pub fn applyBatchToLogits(self: TokenBitmask, logits: []f32, indices: ?[]const i32) void {
+        apply_token_bitmask_inplace_cpu_batch(
+            logits,
+            self.words,
+            @intCast(self.vocab_size),
+            @intCast(self.batch_size),
+            indices,
+        );
+    }
+};
+
+fn last_word_mask(vocab_size: usize) u32 {
+    const rem = vocab_size % 32;
+    if (rem == 0) return 0xFFFF_FFFF;
+    return (@as(u32, 1) << @as(u5, @intCast(rem))) - 1;
+}
+
+fn count_allowed_bits(r: []const i32, vocab_size: usize) usize {
+    if (vocab_size == 0) return 0;
+    const last_idx = (vocab_size - 1) / 32;
+    var total: usize = 0;
+    for (r[0..last_idx]) |w| {
+        total += @popCount(@as(u32, @bitCast(w)));
+    }
+    const tail_masked = @as(u32, @bitCast(r[last_idx])) & last_word_mask(vocab_size);
+    total += @popCount(tail_masked);
+    return total;
+}
+
+pub const SingleTokenResult = struct {
+    is_single: bool,
+    token_id: i32,
+};
+
+fn single_token_in_row(r: []const i32, vocab_size: usize) SingleTokenResult {
+    if (vocab_size == 0) return .{ .is_single = false, .token_id = -1 };
+    const last_idx = (vocab_size - 1) / 32;
+    var count: usize = 0;
+    var found: i32 = -1;
+    for (r[0 .. last_idx + 1], 0..) |w, word_idx| {
+        var u: u32 = @bitCast(w);
+        if (word_idx == last_idx) u &= last_word_mask(vocab_size);
+        const pop = @popCount(u);
+        if (pop == 0) continue;
+        count += pop;
+        if (count > 1) return .{ .is_single = false, .token_id = -1 };
+        found = @intCast(word_idx * 32 + @ctz(u));
+    }
+    if (count == 1) {
+        return .{ .is_single = true, .token_id = found };
+    }
+    return .{ .is_single = false, .token_id = -1 };
+}
+
 /// If exactly one token is allowed in batch entry `index`, returns `.{ .is_single = true, .token_id = id }`;
 /// otherwise `.{ .is_single = false, .token_id = -1 }`.
 pub fn is_single_token_bitmask(
     bitmask: []const i32,
     vocab_size: i32,
     index: i32,
-) struct { is_single: bool, token_id: i32 } {
+) SingleTokenResult {
     const r = bitmask_row(bitmask, vocab_size, index);
-    var found: i32 = -1;
-    var count: usize = 0;
-    var t: i32 = 0;
-    while (t < vocab_size) : (t += 1) {
-        if (bit_is_set(r, t)) {
-            count += 1;
-            if (count > 1) return .{ .is_single = false, .token_id = -1 };
-            found = t;
-        }
-    }
-    if (count == 1) {
-        return .{ .is_single = true, .token_id = found };
-    }
-    return .{ .is_single = false, .token_id = -1 };
+    return single_token_in_row(r, @intCast(@max(vocab_size, 0)));
 }
 
 /// Applies a single-row bitmask to `logits` in place, setting every rejected token's logit to `-inf`.
@@ -166,7 +333,7 @@ pub fn apply_token_bitmask_inplace_cpu(
     apply_token_bitmask_inplace_cpu_batch(logits, bitmask, vocab_size, 1, null);
 }
 
-/// Applies bitmask rows to a batched float32 logits buffer in place.
+/// Applies bitmask rows to a batched float32 logits buffer in place using `@Vector(8, f32)` SIMD.
 pub fn apply_token_bitmask_inplace_cpu_batch(
     logits: []f32,
     bitmask: []const i32,
@@ -182,12 +349,12 @@ pub fn apply_token_bitmask_inplace_cpu_batch(
     if (indices) |idxs| {
         for (idxs) |row_i32| {
             const row_idx: usize = @intCast(row_i32);
-            apply_row(logits, bitmask, vocab_size, vocab, batch, words, row_idx);
+            apply_row(logits, bitmask, vocab, batch, words, row_idx);
         }
     } else {
         std.debug.assert(bitmask.len == batch * words);
         for (0..batch) |row_idx| {
-            apply_row(logits, bitmask, vocab_size, vocab, batch, words, row_idx);
+            apply_row(logits, bitmask, vocab, batch, words, row_idx);
         }
     }
 }
@@ -195,7 +362,6 @@ pub fn apply_token_bitmask_inplace_cpu_batch(
 fn apply_row(
     logits: []f32,
     bitmask: []const i32,
-    vocab_size: i32,
     vocab: usize,
     batch: usize,
     words: usize,
@@ -205,10 +371,49 @@ fn apply_row(
     std.debug.assert((row_idx + 1) * words <= bitmask.len);
     const bm = bitmask[row_idx * words .. (row_idx + 1) * words];
     const logits_row = logits[row_idx * vocab .. (row_idx + 1) * vocab];
-    var token: i32 = 0;
-    while (token < vocab_size) : (token += 1) {
-        if (!bit_is_set(bm, token)) {
-            logits_row[@intCast(token)] = -std.math.inf(f32);
+    apply_simd_mask(logits_row, bm, vocab);
+}
+
+fn apply_simd_mask(logits_row: []f32, bm: []const i32, vocab: usize) void {
+    if (vocab == 0) return;
+    const mask_bits: @Vector(8, u8) = .{ 1, 2, 4, 8, 16, 32, 64, 128 };
+    const zeros_u8: @Vector(8, u8) = @splat(0);
+    const neg_inf: @Vector(8, f32) = @splat(-std.math.inf(f32));
+
+    var t: usize = 0;
+    while (t + 32 <= vocab) : (t += 32) {
+        const w = bm[t >> 5];
+        if (w == -1) continue;
+        if (w == 0) {
+            @memset(logits_row[t .. t + 32], -std.math.inf(f32));
+            continue;
+        }
+        const uword: u32 = @bitCast(w);
+        inline for (0..4) |lane_group| {
+            const byte_bits: u8 = @truncate(uword >> @intCast(lane_group * 8));
+            const pred = (@as(@Vector(8, u8), @splat(byte_bits)) & mask_bits) != zeros_u8;
+            const base = t + lane_group * 8;
+            const cur: @Vector(8, f32) = logits_row[base..][0..8].*;
+            logits_row[base..][0..8].* = @select(f32, pred, cur, neg_inf);
+        }
+    }
+    if (t < vocab) {
+        const uword: u32 = @bitCast(bm[t >> 5]);
+        var bit_off: usize = 0;
+        while (t + 8 <= vocab) {
+            const byte_bits: u8 = @truncate(uword >> @as(u5, @intCast(bit_off)));
+            const pred = (@as(@Vector(8, u8), @splat(byte_bits)) & mask_bits) != zeros_u8;
+            const cur: @Vector(8, f32) = logits_row[t..][0..8].*;
+            logits_row[t..][0..8].* = @select(f32, pred, cur, neg_inf);
+            t += 8;
+            bit_off += 8;
+        }
+        while (t < vocab) {
+            if (((uword >> @as(u5, @intCast(bit_off))) & 1) == 0) {
+                logits_row[t] = -std.math.inf(f32);
+            }
+            t += 1;
+            bit_off += 1;
         }
     }
 }
