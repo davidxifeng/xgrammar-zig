@@ -81,6 +81,17 @@ pub const RegexIr = struct {
         rule_hint: []const u8,
         err_msg: ?*?[]u8,
     ) RegexError!RegexIr {
+        return parse_with_options(allocator, regex_with_flags, builder, rule_hint, false, err_msg);
+    }
+
+    pub fn parse_with_options(
+        allocator: Allocator,
+        regex_with_flags: []const u8,
+        builder: ?*GrammarBuilder,
+        rule_hint: []const u8,
+        is_json_string: bool,
+        err_msg: ?*?[]u8,
+    ) RegexError!RegexIr {
         const prefix = [_]u8{ '(', '?', 'i', ')' };
         const has_flags = std.mem.startsWith(u8, regex_with_flags, &prefix);
         const regex = if (has_flags) regex_with_flags[prefix.len..] else regex_with_flags;
@@ -313,10 +324,13 @@ pub const RegexIr = struct {
                             // repetition normalizer), so the lower bound is relaxed to 0.
                             repeat.lower = 0;
                         }
+                        top.Node.node.deinit(allocator);
                         const hint: []const u8 = if (rule_hint.len == 0) "regex" else rule_hint;
                         const b = builder.?;
-                        const body = try b.add_regex(inner_regex.items, false);
-                        const rule_id = try b.add_rule_with_hint(std.fmt.allocPrint(allocator, "{s}_repeat", .{hint}) catch |e2| return e2, body);
+                        const body = try b.add_regex(inner_regex.items, is_json_string);
+                        const repeat_hint = try std.fmt.allocPrint(allocator, "{s}_repeat", .{hint});
+                        defer allocator.free(repeat_hint);
+                        const rule_id = try b.add_rule_with_hint(repeat_hint, body);
                         b.update_lookahead_exact(rule_id, true);
                         if (repeat.upper != REPEAT_NO_UPPER_BOUND) {
                             break :blk .{ .RepeatSubrule = .{ .rule_id = rule_id, .lower = repeat.lower, .upper = repeat.upper } };
@@ -531,7 +545,7 @@ pub const RegexIr = struct {
 
         // A single copy is accepting when the lower bound is at most 1.
         var new_ends: std.ArrayList(i32) = .empty;
-        errdefer new_ends.deinit(self.allocator);
+        defer new_ends.deinit(self.allocator);
         if (lower <= 1) try new_ends.appendSlice(self.allocator, result.get_ends());
 
         if (has_upper_bound) {

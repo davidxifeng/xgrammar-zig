@@ -20,6 +20,33 @@ const END_STATE_FLAG: i32 = -0x200;
 const SELF_RECURSION_FLAG: i32 = -0x300;
 const SIMPLE_CYCLE_FLAG: i32 = -0x400;
 const UNKNOWN_FLAG: i32 = -0x500;
+const REPEAT_EDGE_FLAG: i32 = -0x600;
+const CHAR_EDGE_FLAG: i32 = -0x700;
+const TOKEN_EDGE_FLAG: i32 = -0x800;
+const EXCLUDE_TOKEN_EDGE_FLAG: i32 = -0x900;
+const EPSILON_EDGE_FLAG: i32 = -0xA00;
+
+fn fold_u64_to_i32(v: u64) i32 {
+    const folded: u32 = @truncate(v ^ (v >> 32));
+    return @bitCast(folded);
+}
+
+fn hash_non_rule_edge(seed: u64, fsm: *const fsm_mod.CompactFsmWithStartEnd, edge: FsmEdge, current_new_state_id: i32, next_new_state_id: i32) u64 {
+    if (edge.is_epsilon()) {
+        return hash_combine_i32(seed, &.{ EPSILON_EDGE_FLAG, current_new_state_id, next_new_state_id });
+    } else if (edge.is_token()) {
+        var h = hash_combine_i32(seed, &.{ TOKEN_EDGE_FLAG, current_new_state_id, next_new_state_id });
+        const ids = fsm.get_fsm().token_edge_info(edge.aux_index()).token_ids();
+        h = hash_combine_i32(h, &.{@intCast(ids.len)});
+        return hash_combine_i32(h, ids);
+    } else if (edge.is_exclude_token()) {
+        var h = hash_combine_i32(seed, &.{ EXCLUDE_TOKEN_EDGE_FLAG, current_new_state_id, next_new_state_id });
+        const ids = fsm.get_fsm().exclude_token_edge_info(edge.aux_index()).token_ids();
+        h = hash_combine_i32(h, &.{@intCast(ids.len)});
+        return hash_combine_i32(h, ids);
+    }
+    return hash_combine_i32(seed, &.{ CHAR_EDGE_FLAG, current_new_state_id, edge.min, edge.max, next_new_state_id });
+}
 
 fn hash_combine(seed: u64, values: []const u64) u64 {
     var result = seed;
@@ -134,6 +161,37 @@ const GrammarFsmHasher = struct {
                     const compact = v.get_fsm().get_fsm();
                     const offset = self.fsm_state_offsets.items[rule_id];
                     try collect_sorted_edges(self, offset, &compact);
+                }
+            }
+        }
+
+        // #963: RegexFsmBuilder can lower large repetitions into new helper rules referenced via
+        // FSM RepeatRef/RuleRef edges absent from the AST. Supplement the ref graph from FSM edges.
+        for (self.grammar.per_rule_fsms_slice(), 0..) |view_opt, referrer_idx| {
+            const view = view_opt orelse continue;
+            const referrer: i32 = @intCast(referrer_idx);
+            const fsm = view.get_fsm();
+            const compact = fsm.get_fsm();
+            var reachable = try fsm.reachable_states();
+            defer reachable.deinit();
+            var it = reachable.keyIterator();
+            while (it.next()) |s_ptr| {
+                for (compact.state_edges(s_ptr.*)) |edge| {
+                    const referee: i32 = if (edge.is_rule_ref())
+                        edge.ref_rule_id()
+                    else if (edge.is_repeat_ref())
+                        compact.repeat_edge_info(edge.aux_index()).rule_id()
+                    else
+                        continue;
+                    if (referee == referrer) continue;
+                    const ref_to_rr = &self.ref_graph_from_referee_to_referrer.items[@intCast(referee)];
+                    if (std.mem.indexOfScalar(i32, ref_to_rr.items, referrer) == null) {
+                        try ref_to_rr.append(gpa, referrer);
+                    }
+                    const rr_to_ref = &self.ref_graph_from_referrer_to_referee.items[@intCast(referrer)];
+                    if (std.mem.indexOfScalar(i32, rr_to_ref.items, referee) == null) {
+                        try rr_to_ref.append(gpa, referee);
+                    }
                 }
             }
         }
@@ -400,6 +458,7 @@ const GrammarFsmHasher = struct {
                     if (!ok) return null;
                 } else if (edge.is_repeat_ref()) {
                     const info = wse.get_fsm().repeat_edge_info(edge.aux_index());
+                    const before_len = hash_and_target.items.len;
                     const ok = try hash_rule_like_edge(
                         self,
                         &hash_and_target,
@@ -410,6 +469,10 @@ const GrammarFsmHasher = struct {
                         edge.target,
                     );
                     if (!ok) return null;
+                    if (hash_and_target.items.len > before_len) {
+                        var last = &hash_and_target.items[hash_and_target.items.len - 1];
+                        last.hash = hash_combine_i32(last.hash, &.{ REPEAT_EDGE_FLAG, info.lower(), info.upper() });
+                    }
                 }
             }
 
@@ -424,7 +487,7 @@ const GrammarFsmHasher = struct {
                 const res = try state_map.get_or_insert(gpa, edge.target);
                 if (res.inserted) try bfs_queue.pushBack(gpa, edge.target);
                 if (edge.is_rule_ref() or edge.is_repeat_ref()) continue;
-                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, edge.min, edge.max, res.id });
+                hash_result = hash_non_rule_edge(hash_result, wse, edge, current_new_state_id, res.id);
             }
         }
 
@@ -494,19 +557,19 @@ const GrammarFsmHasher = struct {
                     } else {
                         std.debug.assert(self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)] != null);
                         const hash: u64 = self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)].?;
-                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(u32, @truncate(hash))), .target = edge.target });
+                        try hash_and_target.append(gpa, .{ .hash = fold_u64_to_i32(hash), .target = edge.target });
                     }
                 } else if (edge.is_repeat_ref()) {
                     const info = wse.get_fsm().repeat_edge_info(edge.aux_index());
                     const ref_rule_id = info.rule_id();
                     if (ref_rule_id == fsm_index) {
-                        const repeat_hash = hash_combine_i32(@bitCast(@as(i64, SELF_RECURSION_FLAG)), &.{ info.lower(), info.upper() });
-                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(u32, @truncate(repeat_hash))), .target = edge.target });
+                        const repeat_hash = hash_combine_i32(@bitCast(@as(i64, SELF_RECURSION_FLAG)), &.{ REPEAT_EDGE_FLAG, info.lower(), info.upper() });
+                        try hash_and_target.append(gpa, .{ .hash = fold_u64_to_i32(repeat_hash), .target = edge.target });
                     } else {
                         std.debug.assert(self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)] != null);
                         const base_hash: u64 = self.per_rule_fsm_hashes.items[@intCast(ref_rule_id)].?;
-                        const repeat_hash = hash_combine_i32(base_hash, &.{ info.lower(), info.upper() });
-                        try hash_and_target.append(gpa, .{ .hash = @bitCast(@as(u32, @truncate(repeat_hash))), .target = edge.target });
+                        const repeat_hash = hash_combine_i32(base_hash, &.{ REPEAT_EDGE_FLAG, info.lower(), info.upper() });
+                        try hash_and_target.append(gpa, .{ .hash = fold_u64_to_i32(repeat_hash), .target = edge.target });
                     }
                 }
             }
@@ -522,7 +585,7 @@ const GrammarFsmHasher = struct {
                 const res = try state_map.get_or_insert(gpa, edge.target);
                 if (res.inserted) try bfs_queue.pushBack(gpa, edge.target);
                 if (edge.is_rule_ref() or edge.is_repeat_ref()) continue;
-                hash_result = hash_combine_i32(hash_result, &.{ current_new_state_id, edge.min, edge.max, res.id });
+                hash_result = hash_non_rule_edge(hash_result, wse, edge, current_new_state_id, res.id);
             }
         }
 
@@ -556,7 +619,7 @@ pub fn hash_sequence(allocator: Allocator, grammar: *const Grammar, sequence_id:
     var hash_result: u64 = 0;
     for (sequence_expr.data) |expr_id| {
         const expr = grammar.expr(expr_id);
-        hash_result = hash_combine_i32(hash_result, &.{expr.ty.as_i32()});
+        hash_result = hash_combine_i32(hash_result, &.{ expr.ty.as_i32(), @intCast(expr.data.len) });
         switch (expr.ty) {
             .ByteString, .CharacterClass, .CharacterClassStar, .EmptyStr, .Token, .ExcludeToken, .Regex, .Substring => {
                 for (expr.data) |element| {

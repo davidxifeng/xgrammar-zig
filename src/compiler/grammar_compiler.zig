@@ -287,15 +287,15 @@ pub const GrammarCompiler = struct {
         diag: ?*CompileErrorInfo,
     ) CompileError!CompiledGrammar {
         const sep_str = if (separators) |s|
-            try std.fmt.allocPrint(self.allocator, "({s},{s})", .{ s.item, s.colon })
+            try std.fmt.allocPrint(self.allocator, "some:{d}:{s}:{d}:{s}", .{ s.item.len, s.item, s.colon.len, s.colon })
         else
-            try self.allocator.dupe(u8, "null");
+            try self.allocator.dupe(u8, "none");
         defer self.allocator.free(sep_str);
 
         const key = try std.fmt.allocPrint(
             self.allocator,
-            "schema:{any}:{?d}:{s}:{any}:{?d}:{any}:{s}",
-            .{ any_whitespace, indent, sep_str, strict_mode, max_whitespace_cnt, any_order, schema },
+            "schema:ws={any}:ind={?d}:sep={s}:strict={any}:mwc={?d}:order={any}:len={d}:{s}",
+            .{ any_whitespace, indent, sep_str, strict_mode, max_whitespace_cnt, any_order, schema.len, schema },
         );
         if (self.try_cache_get(key)) |hit| {
             self.allocator.free(key);

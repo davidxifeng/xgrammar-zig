@@ -80,7 +80,18 @@ pub const RegexEscape = union(enum) {
                 &.{ .{ '0', '9' }, .{ 'A', 'Z' }, .{ '_', '_' }, .{ 'a', 'z' } },
                 escaped == 'W',
             ),
-            's', 'S' => return class_escape(allocator, &.{.{ 0x09, 0x0D }, .{ ' ', ' ' }}, escaped == 'S'),
+            's', 'S' => return class_escape(allocator, &.{
+                .{ 0x09, 0x0D },
+                .{ 0x20, 0x20 },
+                .{ 0xA0, 0xA0 },
+                .{ 0x1680, 0x1680 },
+                .{ 0x2000, 0x200A },
+                .{ 0x2028, 0x2029 },
+                .{ 0x202F, 0x202F },
+                .{ 0x205F, 0x205F },
+                .{ 0x3000, 0x3000 },
+                .{ 0xFEFF, 0xFEFF },
+            }, escaped == 'S'),
             'x' => {
                 const codepoint = if (pos.* + 2 <= regex.len)
                     hex_value(regex[pos.* .. pos.* + 2]) orelse

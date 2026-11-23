@@ -405,13 +405,6 @@ pub fn serialize_json(arena: Allocator, value: Value) Allocator.Error![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-fn trim_fraction(text: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, text, '.') != null) {
-        return std.mem.trimEnd(u8, std.mem.trimEnd(u8, text, "0"), ".");
-    }
-    return text;
-}
-
 fn write_number(arena: Allocator, out: *std.ArrayList(u8), int: ?i64, double: ?f64, raw: ?[]const u8) Allocator.Error!void {
     if (int) |integer| {
         try out.print(arena, "{d}", .{integer});
@@ -424,24 +417,20 @@ fn write_number(arena: Allocator, out: *std.ArrayList(u8), int: ?i64, double: ?f
             try out.appendSlice(arena, text);
             return;
         }
-        // printf("%.17g"): scientific notation outside [1e-4, 1e17).
-        var buf: [1100]u8 = undefined;
-        const scientific = std.fmt.float.render(&buf, double_value, .{ .mode = .scientific, .precision = 16 }) catch unreachable;
-        const e_index = std.mem.indexOfScalar(u8, scientific, 'e').?;
-        const mantissa = scientific[0..e_index];
-        const exponent = std.fmt.parseInt(i32, scientific[e_index + 1 ..], 10) catch unreachable;
-        if (exponent >= -4 and exponent < 17) {
-            const text = try @import("range_regex.zig").format_fixed(arena, double_value, @intCast(16 - exponent));
-            defer arena.free(text);
-            try out.appendSlice(arena, trim_fraction(text));
+        // Preserve shortest exact JSON decimal representation (#926).
+        const abs_val = @abs(double_value);
+        if (abs_val == 0.0) {
+            try out.appendSlice(arena, if (std.math.signbit(double_value)) "-0" else "0");
+            return;
+        }
+        if (abs_val >= 1e-4 and abs_val < 1e16) {
+            var dec_buf: [std.fmt.float.bufferSize(.decimal, f64)]u8 = undefined;
+            const dec = std.fmt.float.render(&dec_buf, double_value, .{ .mode = .decimal }) catch unreachable;
+            try out.appendSlice(arena, dec);
         } else {
-            const sign: u8 = if (exponent < 0) '-' else '+';
-            const trimmed = trim_fraction(mantissa);
-            if (@abs(exponent) < 10) {
-                try out.print(arena, "{s}e{c}{c}{d}", .{ trimmed, sign, '0', @abs(exponent) });
-            } else {
-                try out.print(arena, "{s}e{c}{d}", .{ trimmed, sign, @abs(exponent) });
-            }
+            var sci_buf: [std.fmt.float.bufferSize(.scientific, f64)]u8 = undefined;
+            const sci = std.fmt.float.render(&sci_buf, double_value, .{ .mode = .scientific }) catch unreachable;
+            try out.appendSlice(arena, sci);
         }
         return;
     }
@@ -1138,19 +1127,54 @@ pub const SchemaParser = struct {
 
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(self.arena);
-        var it = std.mem.tokenizeScalar(u8, uri[2..], '/');
-        while (it.next()) |p| {
-            if (p.len != 0) try parts.append(self.arena, p);
+        var rest = uri[2..];
+        while (true) {
+            const slash = std.mem.indexOfScalar(u8, rest, '/');
+            const seg = if (slash) |idx| rest[0..idx] else rest;
+            if (seg.len != 0 or parts.items.len > 0 or slash != null) {
+                var decoded: std.ArrayList(u8) = .empty;
+                var si: usize = 0;
+                while (si < seg.len) {
+                    if (seg[si] == '~' and si + 1 < seg.len) {
+                        if (seg[si + 1] == '1') {
+                            try decoded.append(self.arena, '/');
+                            si += 2;
+                            continue;
+                        } else if (seg[si + 1] == '0') {
+                            try decoded.append(self.arena, '~');
+                            si += 2;
+                            continue;
+                        }
+                    }
+                    try decoded.append(self.arena, seg[si]);
+                    si += 1;
+                }
+                try parts.append(self.arena, try decoded.toOwnedSlice(self.arena));
+            }
+            if (slash) |idx| {
+                rest = rest[idx + 1 ..];
+            } else break;
         }
         var current = self.root_schema;
         for (parts.items) |p| {
-            if (current != .object) {
-                return failFmt(error.InvalidSchema, diag, self.gpa, "Cannot find field {s} in {s}", .{ p, uri });
+            switch (current) {
+                .object => |obj| {
+                    current = obj.get(p) orelse {
+                        return failFmt(error.InvalidSchema, diag, self.gpa, "Cannot find field {s} in {s}", .{ p, uri });
+                    };
+                },
+                .array => |arr| {
+                    const valid_idx = p.len > 0 and (p.len == 1 or p[0] != '0');
+                    const parsed_idx = if (valid_idx) std.fmt.parseInt(usize, p, 10) catch null else null;
+                    if (parsed_idx == null or parsed_idx.? >= arr.items.len) {
+                        return failFmt(error.InvalidSchema, diag, self.gpa, "Cannot find index {s} in {s}", .{ p, uri });
+                    }
+                    current = arr.items[parsed_idx.?];
+                },
+                else => {
+                    return failFmt(error.InvalidSchema, diag, self.gpa, "Cannot find field {s} in {s}", .{ p, uri });
+                },
             }
-            const next = current.object.get(p) orelse {
-                return failFmt(error.InvalidSchema, diag, self.gpa, "Cannot find field {s} in {s}", .{ p, uri });
-            };
-            current = next;
         }
         const resolved = try self.parse(current, null, diag);
         try self.ref_cache.put(try self.arena.dupe(u8, uri), resolved);

@@ -909,6 +909,17 @@ pub const GrammarMatcher = struct {
         return accepted;
     }
 
+    fn has_token_edge_in_latest_states(self: *const GrammarMatcher) bool {
+        const g = self.parser.grammar;
+        for (self.parser.latest_scanable_states()) |st| {
+            const wse = g.per_rule_fsm(st.rule_id) orelse continue;
+            for (wse.get_fsm().get_fsm().state_edges(st.element_id)) |edge| {
+                if (edge.is_exclude_token() or edge.is_token()) return true;
+            }
+        }
+        return false;
+    }
+
     fn accept_token_definitive(
         self: *GrammarMatcher,
         token_id: i32,
@@ -932,7 +943,10 @@ pub const GrammarMatcher = struct {
             break :blk false;
         };
 
-        if (is_stop_token) {
+        // #710: Only short-circuit as EOS termination when the root grammar can end here
+        // (or terminate_without_stop_token is set). Otherwise fall through so stop tokens
+        // that complete or advance the grammar itself are matched normally.
+        if (is_stop_token and (self.parser.is_root_completed() or self.terminate_without_stop_token)) {
             const ok = try self.accept_stop_token();
             return ok and self.finish_accept(consumed_past_deadline);
         }
@@ -974,8 +988,24 @@ pub const GrammarMatcher = struct {
         }
         var pos: i32 = 0;
         var byte_path_success = true;
+        var mid_token_atomic = false;
         for (token) |byte| {
             if (!try self.advance_byte(byte)) {
+                // #942: Token began matching a literal and entered a token-level free-text region.
+                if (pos > 0 and self.has_token_edge_in_latest_states()) {
+                    const saved_relax = self.record_char_budget_relaxation;
+                    self.record_char_budget_relaxation = false;
+                    const mid_ok = if (has_char_budget_rules)
+                        try self.advance_atomic_token_with_character_budget(token_id, token_char_count)
+                    else
+                        try unwrap_earley_bool(self.parser.advance_atomic_token(token_id, 0));
+                    self.record_char_budget_relaxation = saved_relax;
+                    if (mid_ok) {
+                        pos += 1;
+                        mid_token_atomic = true;
+                        break;
+                    }
+                }
                 byte_path_success = false;
                 break;
             }
@@ -1015,9 +1045,15 @@ pub const GrammarMatcher = struct {
                 try self.append_atomic_row(token);
             }
         } else if (byte_path_success and !atomic_success) {
-            try self.token_length_history.append(self.allocator, @intCast(token.len));
+            try self.token_length_history.append(self.allocator, pos);
             if (self.should_track_accepted_bytes()) {
-                try self.append_per_byte_rows(token);
+                if (mid_token_atomic) {
+                    const split: usize = @intCast(pos - 1);
+                    try self.append_per_byte_rows(token[0..split]);
+                    try self.append_atomic_row(token[split..]);
+                } else {
+                    try self.append_per_byte_rows(token);
+                }
             }
         } else {
             const arow = &atomic_row.?;
@@ -1035,9 +1071,15 @@ pub const GrammarMatcher = struct {
                 }
             } else {
                 try self.merge_atomic_row_into_byte_path(size_before_token, arow);
-                try self.token_length_history.append(self.allocator, @intCast(token.len));
+                try self.token_length_history.append(self.allocator, pos);
                 if (self.should_track_accepted_bytes()) {
-                    try self.append_per_byte_rows(token);
+                    if (mid_token_atomic) {
+                        const split: usize = @intCast(pos - 1);
+                        try self.append_per_byte_rows(token[0..split]);
+                        try self.append_atomic_row(token[split..]);
+                    } else {
+                        try self.append_per_byte_rows(token);
+                    }
                 }
             }
         }
@@ -1046,7 +1088,11 @@ pub const GrammarMatcher = struct {
             _ = try self.apply_character_budget_enforcement_to_fixed_point();
         }
         self.record_char_budget_relaxation = false;
-        return self.finish_accept(consumed_past_deadline);
+        const ok = self.finish_accept(consumed_past_deadline);
+        if (ok and is_stop_token and self.parser.is_root_completed() and !self.terminate_without_stop_token) {
+            self.parser.stop_token_is_accepted = true;
+        }
+        return ok;
     }
 
     fn merge_atomic_row_into_byte_path(
@@ -1525,10 +1571,32 @@ pub const GrammarMatcher = struct {
                     prev_matched_size = @min(prev_matched_size, lcp_len);
                 }
 
+                var retried_atomically = false;
                 if (accepted) {
                     const start_j: usize = @intCast(prev_matched_size);
                     for (cur_token[start_j..], start_j..) |byte, j| {
                         if (!try self.advance_byte(byte)) {
+                            // #942: Allow transitioning mid-token from literal into a token-level free-text region.
+                            if (prev_matched_size > 0 and self.has_token_edge_in_latest_states()) {
+                                const saved_cap = self.parser.capture_recording;
+                                const saved_relax = self.record_char_budget_relaxation;
+                                self.parser.capture_recording = false;
+                                self.record_char_budget_relaxation = false;
+                                const mid_ok = if (has_char_budget_rules)
+                                    try self.advance_atomic_token_with_character_budget(
+                                        sorted_decoded_vocab[cur_u].id,
+                                        token_char_counts[cur_u],
+                                    )
+                                else
+                                    try unwrap_earley_bool(self.parser.advance_atomic_token(sorted_decoded_vocab[cur_u].id, 0));
+                                self.parser.capture_recording = saved_cap;
+                                self.record_char_budget_relaxation = saved_relax;
+                                if (mid_ok) {
+                                    prev_matched_size += 1;
+                                    retried_atomically = true;
+                                    break;
+                                }
+                            }
                             last_rejected_uncertain_range = subtree_range[cur_u];
                             accepted = false;
                             break;
@@ -1540,7 +1608,6 @@ pub const GrammarMatcher = struct {
                     }
                 }
 
-                var retried_atomically = false;
                 if (!accepted and has_char_budget_rules and self.has_token_edges) {
                     retried_atomically = true;
                     self.parser.pop_last_states(prev_matched_size + 1);
@@ -1620,9 +1687,54 @@ pub const GrammarMatcher = struct {
                 }
             }
         }
+        // #710: Allow a stop token if the root is already complete OR if matching the stop token itself completes the grammar.
         for (self.stop_token_ids) |id| {
-            set_bit(row_words, id, can_reach_end);
+            const allow_stop = if (can_reach_end) true else try self.does_stop_token_complete_grammar(id);
+            set_bit(row_words, id, allow_stop);
         }
+    }
+
+    fn does_stop_token_complete_grammar(self: *GrammarMatcher, token_id: i32) Allocator.Error!bool {
+        if (self.parser.is_root_completed()) return true;
+        const tok = self.tokenizer_info();
+        if (token_id < 0 or @as(usize, @intCast(token_id)) >= tok.vocab_size) return false;
+        const tid_u: usize = @intCast(token_id);
+        const token = if (tid_u < tok.decoded_vocab.len) tok.decoded_vocab[tid_u] else "";
+
+        const has_char_budget = self.parser.has_char_budget_rules;
+        var row_before: ?ParserRow = if (has_char_budget) try self.parser.latest_row(self.allocator) else null;
+        defer if (row_before) |*r| r.deinit(self.allocator);
+        const saved_relax = self.record_char_budget_relaxation;
+        const saved_relaxed = self.char_budget_relaxed;
+        self.record_char_budget_relaxation = false;
+        defer {
+            self.record_char_budget_relaxation = saved_relax;
+            self.char_budget_relaxed = saved_relaxed;
+        }
+
+        // Check atomic token transition (supports Token edges matching special stop tokens too).
+        const atomic_ok = try unwrap_earley_bool(self.parser.advance_atomic_token(token_id, 0));
+        if (atomic_ok) {
+            const completed = self.parser.is_root_completed();
+            self.parser.pop_last_states(1);
+            if (row_before) |snap| try self.parser.replace_latest_row(snap);
+            if (completed) return true;
+        }
+
+        if (token.len == 0) return false;
+        var pos: i32 = 0;
+        var byte_ok = true;
+        for (token) |byte| {
+            if (!try self.advance_byte(byte)) {
+                byte_ok = false;
+                break;
+            }
+            pos += 1;
+        }
+        const completed_by_bytes = byte_ok and self.parser.is_root_completed();
+        self.parser.pop_last_states(pos);
+        if (row_before) |snap| try self.parser.replace_latest_row(snap);
+        return completed_by_bytes;
     }
 
     /// Finds the longest jump-forward byte sequence valid from the current state (caller owns slice).
@@ -1687,6 +1799,23 @@ pub const GrammarMatcher = struct {
             num_accepted_chars += 1;
         }
         self.parser.pop_last_states(num_accepted_chars);
+        // #1012: Keep jump-forward string aligned to complete UTF-8 character boundaries.
+        const slice = result.items;
+        if (slice.len > 0) {
+            if (!EarleyParser.starts_utf8_codepoint(slice[0])) {
+                result.clearRetainingCapacity();
+            } else {
+                var valid_len: usize = 0;
+                while (valid_len < slice.len) {
+                    const cp_len = std.unicode.utf8ByteSequenceLength(slice[valid_len]) catch break;
+                    if (valid_len + cp_len > slice.len) break;
+                    if (std.unicode.utf8Decode(slice[valid_len .. valid_len + cp_len])) |_| {
+                        valid_len += cp_len;
+                    } else |_| break;
+                }
+                result.shrinkRetainingCapacity(valid_len);
+            }
+        }
         return result.toOwnedSlice(allocator);
     }
 
@@ -1709,6 +1838,9 @@ pub const GrammarMatcher = struct {
                 const truncated_bytes: usize = @intCast(self.row_byte_end.items[self.row_byte_end.items.len - 1]);
                 self.accepted_bytes.shrinkRetainingCapacity(truncated_bytes);
             }
+        }
+        if (num_tokens > 0) {
+            self.parser.stop_token_is_accepted = false;
         }
         self.budget_enforce_pending = false;
         self.budget_force_close_pending = false;

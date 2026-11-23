@@ -251,7 +251,7 @@ test "test_regex_escapes" {
     try std.testing.expect(try m4.accept_string("好好"));
     try std.testing.expect(!try m4.accept_string("\xbd"));
 
-    // \s matches exactly the standard whitespace characters [ \t\n\r\f\v].
+    // \s follows ECMAScript WhiteSpace + LineTerminator (ASCII whitespace + U+00A0, U+3000, U+FEFF, ...).
     var m5 = try build(a, "\\s+");
     defer m5.deinit();
     try std.testing.expect(try m5.accept_string(" \t\n\r\x0c\x0b"));

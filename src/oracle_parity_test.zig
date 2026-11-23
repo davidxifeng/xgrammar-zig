@@ -212,8 +212,10 @@ test "oracle parity: byte_fallback_padded_prefix_space and multiword enum" {
         .{ .token_id = 7, .fill_ok = true, .accepted = true, .bitmask = &.{164}, .completed = true, .terminated = false },
     }, "");
 
+    // v0.2.9 (#1012): find_jump_forward_string aligns to whole UTF-8 codepoint boundaries,
+    // returning "" instead of mid-codepoint continuation bytes 0xB8 0xAD.
     try verifySequence(&compiled, tok.vocab_size, &.{
         .{ .token_id = 2, .fill_ok = true, .accepted = true, .bitmask = &.{36}, .completed = false, .terminated = false },
         .{ .token_id = 5, .fill_ok = true, .accepted = false, .bitmask = &.{8}, .completed = false, .terminated = false },
-    }, &.{ 0xB8, 0xAD });
+    }, "");
 }

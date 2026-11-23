@@ -51,12 +51,14 @@ pub const RegexFsmBuilder = struct {
         rule_hint: []const u8,
         err_msg: ?*?[]u8,
     ) regex_ir_errors!FsmWithStartEnd {
-        var fsm_wse = try build(allocator, regex, builder, rule_hint, err_msg);
-        errdefer fsm_wse.deinit();
         var any = false;
         for (forbidden_chars) |f| {
             if (f) any = true;
         }
+        var ir = try RegexIr.parse_with_options(allocator, regex, builder, rule_hint, any, err_msg);
+        defer ir.deinit();
+        var fsm_wse = try ir.build(err_msg);
+        errdefer fsm_wse.deinit();
         if (!any) return fsm_wse;
 
         var new_fsm = try Fsm.new(allocator, @intCast(fsm_wse.num_states()));

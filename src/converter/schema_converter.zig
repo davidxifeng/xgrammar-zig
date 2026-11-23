@@ -244,7 +244,7 @@ pub fn json_add_basic_rules(
     var compact = try IndentManager.init(
         b.arena,
         null,
-        if (any_whitespace) "," else ", ",
+        b.indent_manager.separator,
         any_whitespace,
         if (any_whitespace) b.max_whitespace_cnt else null,
     );

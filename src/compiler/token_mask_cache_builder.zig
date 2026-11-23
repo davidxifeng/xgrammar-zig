@@ -143,6 +143,14 @@ pub const GrammarMatcherForTokenMaskCache = struct {
         const lookahead_id = self.grammar.rule(self.init_rule_id).lookahead_assertion_id;
         const is_exact_lookahead = self.grammar.rule(self.init_rule_id).is_exact_lookahead;
         var lookahead_hash: ?u64 = null;
+        var has_repeat_parent_ctx = false;
+        var repeat_parent_hash: u64 = 0;
+        if (lookahead_id == grammar_mod.NO_EXPR and is_exact_lookahead) {
+            var repeat_parent_states: std.ArrayList(RepeatParentContinuation) = .empty;
+            defer repeat_parent_states.deinit(self.allocator);
+            repeat_parent_hash = try collect_repeat_parent_continuations(self.allocator, self.grammar, self.init_rule_id, &repeat_parent_states);
+            has_repeat_parent_ctx = repeat_parent_states.items.len > 0;
+        }
 
         if (rule_level_cache_is_available) {
             lookahead_hash = try functor.grammar_fsm_hash_sequence(self.allocator, self.grammar, lookahead_id);
@@ -166,12 +174,23 @@ pub const GrammarMatcherForTokenMaskCache = struct {
                 if (try rlc.get_cache(self.allocator, combined_hash, new_state_id, fsm.get_node_num(), fsm.get_edge_num())) |cached| {
                     return cached;
                 }
+            } else if (has_repeat_parent_ctx) {
+                const combined_hash = hash_combine(&.{
+                    fsm_hash.?,
+                    repeat_parent_hash,
+                    @intFromBool(true),
+                });
+                if (try rlc.get_cache(self.allocator, combined_hash, new_state_id, fsm.get_node_num(), fsm.get_edge_num())) |cached| {
+                    return cached;
+                }
             }
-            if (try rlc.get_cache(self.allocator, fsm_hash.?, new_state_id, fsm.get_node_num(), fsm.get_edge_num())) |cached_mut| {
-                var cache = cached_mut;
-                errdefer cache.deinit();
-                try self.adapt_cache_with_lookahead(&cache, is_root_rule);
-                return cache;
+            if (!has_repeat_parent_ctx) {
+                if (try rlc.get_cache(self.allocator, fsm_hash.?, new_state_id, fsm.get_node_num(), fsm.get_edge_num())) |cached_mut| {
+                    var cache = cached_mut;
+                    errdefer cache.deinit();
+                    try self.adapt_cache_with_lookahead(&cache, is_root_rule);
+                    return cache;
+                }
             }
         }
 
@@ -225,16 +244,32 @@ pub const GrammarMatcherForTokenMaskCache = struct {
         errdefer return_value.deinit();
 
         if (rule_level_cache_is_available) {
-            try self.store_rule_level_cache(
-                fsm_hash.?,
-                new_state_id,
-                lookahead_id,
-                is_root_rule,
-                is_exact_lookahead,
-                lookahead_hash,
-                &return_value,
-                rejected_filled,
-            );
+            if (has_repeat_parent_ctx) {
+                const fsm = self.grammar.per_rule_fsm(self.init_rule_id).?;
+                const combined_hash = hash_combine(&.{
+                    fsm_hash.?,
+                    repeat_parent_hash,
+                    @intFromBool(true),
+                });
+                _ = try self.rule_level_cache.?.add_cache(
+                    combined_hash,
+                    new_state_id,
+                    fsm.get_node_num(),
+                    fsm.get_edge_num(),
+                    &return_value,
+                );
+            } else {
+                try self.store_rule_level_cache(
+                    fsm_hash.?,
+                    new_state_id,
+                    lookahead_id,
+                    is_root_rule,
+                    is_exact_lookahead,
+                    lookahead_hash,
+                    &return_value,
+                    rejected_filled,
+                );
+            }
         }
         return return_value;
     }
@@ -693,6 +728,17 @@ pub const GrammarMatcherForTokenMaskCache = struct {
                         }
                         i = end - 1;
                     }
+                } else if (prev_matched_size > 0 and has_token_edge_in_latest_states(self.grammar, self.parser.latest_scanable_states())) {
+                    // #942: A token whose prefix entered a token-level Token/ExcludeToken state
+                    // may finish atomically even though byte-by-byte advancing stopped at the boundary.
+                    const mid_ok = try unwrap_earley_bool(self.parser.advance_atomic_token(sorted_decoded_vocab[ui].id, 0));
+                    if (mid_ok) {
+                        self.parser.pop_last_states(1);
+                        try self.tmp_uncertain_indices.append(self.allocator, i);
+                    } else if (fill_reject_indices) {
+                        try self.tmp_rejected_indices.append(self.allocator, i);
+                        fill_reject_indices = self.tmp_rejected_indices.items.len < AdaptiveTokenMask.USE_BITSET_THRESHOLD;
+                    }
                 } else {
                     try self.tmp_rejected_indices.append(self.allocator, i);
                     last_rejected_range = subtree_nodes_range[ui];
@@ -858,18 +904,34 @@ fn lower_bound_sorted_vocab(
     return lo;
 }
 
+pub const LookaheadAssertionResult = struct {
+    accepted: bool,
+    can_reach_end: bool,
+};
+
 pub fn is_token_pass_lookahead_assertion(
     parser: *EarleyParser,
     grammar: *const Grammar,
     init_rule_id: i32,
     token: []const u8,
     can_reach_end_stack: []const bool,
-) Allocator.Error!struct { accepted: bool, can_reach_end: bool } {
+) Allocator.Error!LookaheadAssertionResult {
     var accepted = true;
     var can_reach_end = true;
     const lookahead_assertion_id = grammar.rule(init_rule_id).lookahead_assertion_id;
     if (lookahead_assertion_id == NO_EXPR) {
-        return .{ .accepted = accepted, .can_reach_end = can_reach_end };
+        if (!grammar.rule(init_rule_id).is_exact_lookahead) {
+            return .{ .accepted = accepted, .can_reach_end = can_reach_end };
+        }
+        // #903: Classify a bounded-repeat body alongside its parent rule's post-repeat states
+        // so invalid post-repeat continuations are rejected statically instead of marked uncertain.
+        var parent_conts: std.ArrayList(RepeatParentContinuation) = .empty;
+        defer parent_conts.deinit(parser.gpa);
+        _ = try collect_repeat_parent_continuations(parser.gpa, grammar, init_rule_id, &parent_conts);
+        if (parent_conts.items.len == 0) {
+            return .{ .accepted = accepted, .can_reach_end = can_reach_end };
+        }
+        return check_repeat_parent_lookahead(parser, grammar, init_rule_id, token, can_reach_end_stack, parent_conts.items);
     }
 
     var lookahead_state = ParserState.new(-1, lookahead_assertion_id, 0, ParserState.NO_PREV_INPUT_POS);
@@ -910,6 +972,156 @@ pub fn is_token_pass_lookahead_assertion(
     can_reach_end = false;
     accepted = false;
     return .{ .accepted = accepted, .can_reach_end = can_reach_end };
+}
+
+fn has_token_edge_in_latest_states(grammar: *const Grammar, states: []const ParserState) bool {
+    for (states) |st| {
+        const wse = grammar.per_rule_fsm(st.rule_id) orelse continue;
+        for (wse.get_fsm().get_fsm().state_edges(st.element_id)) |edge| {
+            if (edge.is_exclude_token() or edge.is_token()) return true;
+        }
+    }
+    return false;
+}
+
+const RepeatParentContinuation = struct {
+    parent_rule_id: i32,
+    parent_body_expr_id: i32,
+    target_elem_id: i32,
+};
+
+fn collect_repeat_parent_continuations(
+    gpa: Allocator,
+    grammar: *const Grammar,
+    body_rule_id: i32,
+    out: *std.ArrayList(RepeatParentContinuation),
+) Allocator.Error!u64 {
+    var hash_val: u64 = 0;
+    const num_rules = grammar.num_rules();
+    var p_id: i32 = 0;
+    while (p_id < num_rules) : (p_id += 1) {
+        const wse = grammar.per_rule_fsm(p_id) orelse continue;
+        const fsm = wse.get_fsm();
+        const compact = fsm.get_fsm();
+        const parent_body = grammar.rule(p_id).body_expr_id;
+        var s: i32 = 0;
+        while (s < fsm.num_states()) : (s += 1) {
+            for (compact.state_edges(s)) |edge| {
+                if (edge.is_rule_ref() and edge.ref_rule_id() == body_rule_id) {
+                    out.clearRetainingCapacity();
+                    return 0;
+                }
+                if (edge.is_repeat_ref()) {
+                    const info = compact.repeat_edge_info(edge.aux_index());
+                    if (info.rule_id() == body_rule_id) {
+                        try out.append(gpa, .{
+                            .parent_rule_id = p_id,
+                            .parent_body_expr_id = parent_body,
+                            .target_elem_id = edge.target,
+                        });
+                        const p_hash = grammar.per_rule_fsm_hash(p_id) orelse @as(u64, @intCast(p_id));
+                        hash_val = hash_combine(&.{
+                            hash_val,
+                            p_hash,
+                            @bitCast(@as(i64, edge.target)),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    return hash_val;
+}
+
+fn check_repeat_parent_lookahead(
+    parser: *EarleyParser,
+    grammar: *const Grammar,
+    body_rule_id: i32,
+    token: []const u8,
+    can_reach_end_stack: []const bool,
+    conts: []const RepeatParentContinuation,
+) Allocator.Error!LookaheadAssertionResult {
+    const body_wse = grammar.per_rule_fsm(body_rule_id) orelse
+        return .{ .accepted = true, .can_reach_end = true };
+    const body_expr_id = grammar.rule(body_rule_id).body_expr_id;
+    const body_start = body_wse.get_fsm().get_start();
+
+    var frontier: std.ArrayList(usize) = .empty;
+    defer frontier.deinit(parser.gpa);
+    var visited: std.ArrayList(bool) = .empty;
+    defer visited.deinit(parser.gpa);
+    try visited.appendNTimes(parser.gpa, false, token.len + 1);
+
+    var idx: usize = can_reach_end_stack.len;
+    while (idx > 0) {
+        idx -= 1;
+        if (can_reach_end_stack[idx] and idx < token.len and !visited.items[idx]) {
+            visited.items[idx] = true;
+            try frontier.append(parser.gpa, idx);
+        }
+    }
+
+    var cursor: usize = 0;
+    while (cursor < frontier.items.len) : (cursor += 1) {
+        const p = frontier.items[cursor];
+
+        // Continuation 1: exiting the Repeat into a parent's post-repeat state.
+        for (conts) |cont| {
+            const p_state = ParserState.new(cont.parent_rule_id, cont.parent_body_expr_id, cont.target_elem_id, ParserState.NO_PREV_INPUT_POS);
+            try unwrap_earley_void(parser.push_state_and_expand(p_state));
+            if (parser.is_root_completed()) {
+                parser.pop_last_states(1);
+                return .{ .accepted = true, .can_reach_end = true };
+            }
+            var accepted_bytes: i32 = 0;
+            var ok = true;
+            for (token[p..]) |byte| {
+                if (!try unwrap_earley_bool(parser.advance(byte))) {
+                    ok = false;
+                    break;
+                }
+                accepted_bytes += 1;
+                if (parser.is_root_completed()) {
+                    parser.pop_last_states(accepted_bytes + 1);
+                    return .{ .accepted = true, .can_reach_end = true };
+                }
+            }
+            parser.pop_last_states(accepted_bytes + 1);
+            if (ok) {
+                return .{ .accepted = true, .can_reach_end = true };
+            }
+        }
+
+        // Continuation 2: another repetition of the repeat body rule.
+        const body_state = ParserState.new(body_rule_id, body_expr_id, body_start, ParserState.NO_PREV_INPUT_POS);
+        try unwrap_earley_void(parser.push_state_and_expand(body_state));
+        var body_bytes: i32 = 0;
+        var body_full = true;
+        for (token[p..], p..) |byte, byte_pos| {
+            if (!try unwrap_earley_bool(parser.advance(byte))) {
+                body_full = false;
+                break;
+            }
+            body_bytes += 1;
+            const next_pos = byte_pos + 1;
+            if (parser.is_root_completed()) {
+                if (next_pos == token.len) {
+                    parser.pop_last_states(body_bytes + 1);
+                    return .{ .accepted = true, .can_reach_end = true };
+                }
+                if (!visited.items[next_pos]) {
+                    visited.items[next_pos] = true;
+                    try frontier.append(parser.gpa, next_pos);
+                }
+            }
+        }
+        parser.pop_last_states(body_bytes + 1);
+        if (body_full) {
+            return .{ .accepted = true, .can_reach_end = true };
+        }
+    }
+
+    return .{ .accepted = false, .can_reach_end = false };
 }
 
 fn sorted_set_difference(allocator: Allocator, left: []const i32, right: []const i32) Allocator.Error!std.ArrayList(i32) {

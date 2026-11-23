@@ -302,11 +302,11 @@ const RegexConverter = struct {
             },
             's' => blk: {
                 self.cur += 2;
-                break :blk self.arena.dupe(u8, "\\f\\n\\r\\t\\v\\u0020\\u00a0");
+                break :blk self.arena.dupe(u8, "\\f\\n\\r\\t\\v\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff");
             },
             'S' => blk: {
                 self.cur += 2;
-                break :blk self.arena.dupe(u8, "\\x00-\\x08\\x0E-\\x1F\\x21-\\x9F\\xA1-\\U0010FFFF");
+                break :blk self.arena.dupe(u8, "\\x00-\\x08\\x0E-\\x1F\\x21-\\x9F\\xA1-\\u167F\\u1681-\\u1FFF\\u200B-\\u2027\\u202A-\\u202E\\u2030-\\u205E\\u2060-\\u2FFF\\u3001-\\uFEFE\\uFF00-\\U0010FFFF");
             },
             else => blk: {
                 const res = try self.handle_char_escape();
@@ -341,11 +341,11 @@ const RegexConverter = struct {
             },
             's' => blk: {
                 self.cur += 2;
-                break :blk self.arena.dupe(u8, "[\\f\\n\\r\\t\\v\\u0020\\u00a0]");
+                break :blk self.arena.dupe(u8, "[\\f\\n\\r\\t\\v\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]");
             },
             'S' => blk: {
                 self.cur += 2;
-                break :blk self.arena.dupe(u8, "[^\\f\\n\\r\\t\\v\\u0020\\u00a0]");
+                break :blk self.arena.dupe(u8, "[^\\f\\n\\r\\t\\v\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]");
             },
             '1'...'9', 'k' => self.fail("Backreference is not supported yet."),
             'p', 'P' => self.fail("Unicode character class escape sequence is not supported yet."),
