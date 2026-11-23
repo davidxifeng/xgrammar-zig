@@ -80,3 +80,39 @@ zig test src/xgrammar.zig
 tools/oracle-rs/target/release/oracle < case.json > expected.json
 zig-out/bin/xgrammar-oracle < case.json > actual.json
 ```
+
+## Benchmarks (Zig vs Rust)
+
+Measured side-by-side between **`xgrammar-zig`** (`tools/bench.zig`) and **`xgrammar-rs 0.2.8`** (`tools/oracle-rs/src/bin/bench.rs`) on identical workloads.
+
+- **Environment**: Apple M3 (8 cores, `arm64`), macOS 27.0.1, Zig `0.17.1` (`-Doptimize=ReleaseFast`), `rustc 1.99.1 (58cf8f9c3 2026-10-13)` (`--release`)
+- **Workload**: 32,000-token `.Raw` vocabulary, nested JSON Schema (`user` / `tags` / `score`), 4-rule recursive arithmetic EBNF grammar, and a 33-token JSON decode trace
+- **Sampling**: 1 warmup + 5 timed runs for init/compile benchmarks; 5 warmup + 50 timed 33-token passes for mask fill and E2E decode; 20 warmup + 200x25 calls for `b=1` logit masking; 10 warmup + 100x10 calls for `b=4` logit masking
+- **Parity check**: Both binaries produced identical outputs: `vocab_size = 32000`, `accepted_count = 33`, `bitmask_checksum = 9170455314173489972`
+
+| Benchmark | Rust median (µs) | Zig median (µs) | Ratio (Rust / Zig) | Rust mean (µs) | Zig mean (µs) |
+|---|---:|---:|---:|---:|---:|
+| `TokenizerInfo` init (32K vocab) | 2978.58 | 5197.00 | 0.57x | 3101.83 | 5195.60 |
+| Compile JSON Schema (1 thread) | 3190.21 | 5369.00 | 0.59x | 3247.83 | 5346.40 |
+| Compile JSON Schema (4 threads) | 2605.33 | 3414.00 | 0.76x | 2629.80 | 3408.00 |
+| Compile EBNF (1 thread) | 55.88 | 407.00 | 0.14x | 60.11 | 409.00 |
+| `fill_next_token_bitmask` (32K, /tok) | 1.35 | 1.42 | 0.94x | 1.37 | 1.45 |
+| `apply_token_bitmask_inplace` (32K, `b=1`) | 13.25 | 1.72 | **7.70x** | 13.60 | 1.72 |
+| `apply_token_bitmask_inplace_batch` (128K, `b=4`) | 52.73 | 6.50 | **8.11x** | 53.88 | 6.66 |
+| E2E decode: fill + apply + accept (32K, /tok) | 13.52 | 2.03 | **6.66x** | 13.83 | 2.04 |
+
+**Takeaways:**
+- On the **per-token decoding hot path**, Zig matches Rust on bitmask generation (`1.42 µs` vs `1.35 µs`) and is **7.70x–8.11x faster** on `@Vector(8, f32)` SIMD logit masking, yielding **6.66x faster end-to-end decoding** (`2.03 µs/tok` vs `13.52 µs/tok`).
+- On **one-time initialization and cold compilation**, Rust is currently faster (1.3x–1.7x on 32K vocab init / JSON Schema compilation, and 7.3x on tiny EBNF compilation). Replacing `std.sort.insertion` in `TokenizerInfo` with `std.mem.sortUnstable` reduced 32K vocab init from ~1.79 s to 5.20 ms.
+
+### Reproduce Benchmarks
+
+```sh
+# Build and run Zig release benchmark
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/xgrammar-bench
+
+# Build and run Rust (xgrammar-rs 0.2.8) release benchmark
+cargo build --manifest-path tools/oracle-rs/Cargo.toml --release --bin bench
+tools/oracle-rs/target/release/bench
+```

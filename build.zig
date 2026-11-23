@@ -27,4 +27,16 @@ pub fn build(b: *std.Build) void {
         .root_module = oracle_mod,
     });
     b.installArtifact(oracle_exe);
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("xgrammar", mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "xgrammar-bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
 }

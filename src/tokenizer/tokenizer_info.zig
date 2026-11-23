@@ -213,10 +213,14 @@ pub const TokenizerInfo = struct {
             try special_ids.append(padded);
         }
 
-        // Stable sort by decoded bytes (matches Rust `sort_by`, ties keep id order).
-        std.sort.insertion(SortedDecodedToken, sorted_decoded_vocab.items, {}, struct {
+        // Sort by decoded bytes in O(N log N), breaking ties by `id` to match Rust's stable `sort_by`.
+        std.mem.sortUnstable(SortedDecodedToken, sorted_decoded_vocab.items, {}, struct {
             fn lessThan(_: void, lhs: SortedDecodedToken, rhs: SortedDecodedToken) bool {
-                return std.mem.order(u8, lhs.token, rhs.token) == .lt;
+                return switch (std.mem.order(u8, lhs.token, rhs.token)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => lhs.id < rhs.id,
+                };
             }
         }.lessThan);
         const trie_ranges = try build_trie_ranges(a, sorted_decoded_vocab.items);
