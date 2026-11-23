@@ -8,6 +8,14 @@
 
 const std = @import("std");
 const fsm_mod = @import("mod.zig");
+const functor_mod = @import("../functor/mod.zig");
+const grammar_mod = @import("../grammar/mod.zig");
+const GrammarFsmBuilder = functor_mod.GrammarFsmBuilder;
+const GrammarExpr = grammar_mod.GrammarExpr;
+const TagDispatch = grammar_mod.TagDispatch;
+const TagRulePair = grammar_mod.tag_dispatch.TagRulePair;
+const TokenTagDispatch = grammar_mod.TokenTagDispatch;
+const TriggerRulePair = grammar_mod.token_tag_dispatch.TriggerRulePair;
 const CompactFsm = fsm_mod.CompactFsm;
 const EdgeKind = fsm_mod.EdgeKind;
 const FsmWithStartEnd = fsm_mod.FsmWithStartEnd;
@@ -412,41 +420,447 @@ test "test_regex_large_repeat_without_builder" {
 }
 
 // ---------------------------------------------------------------------------
-// Tests below need `functor::GrammarFsmBuilder` (functor wave): they are kept
-// translated-but-skipped until the functor lands, then re-enabled.
+// Tests below need `functor::GrammarFsmBuilder` (delivered and wired).
 // ---------------------------------------------------------------------------
 
-test "test_tag_dispatch_fsm_builder_skipped_until_functor" {
-    // GrammarFsmBuilder::tag_dispatch string-compare oracles (functor wave).
-    return error.SkipZigTest;
+/// Builds a `TagDispatch` from string tags.
+fn tag_dispatch(a: A, pairs: []const [2][]const u8, loop_after: bool, excludes: []const []const u8) !TagDispatch {
+    var td = TagDispatch.empty();
+    for (pairs) |pair| {
+        try td.tag_rule_pairs.append(a, .{ .tag = try a.dupe(u8, pair[0]), .rule_id = try std.fmt.parseInt(i32, pair[1], 10) });
+    }
+    td.loop_after_dispatch = loop_after;
+    for (excludes) |e| {
+        try td.excludes.append(a, try a.dupe(u8, e));
+    }
+    return td;
 }
 
-test "test_token_tag_dispatch_fsm_builder_skipped_until_functor" {
-    // GrammarFsmBuilder::token_tag_dispatch (functor wave).
-    return error.SkipZigTest;
+test "test_tag_dispatch_fsm_builder1" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const td = try tag_dispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, true, &.{});
+    const fsm_opt = try GrammarFsmBuilder.tag_dispatch(a, &td);
+    const fsm = fsm_opt.?;
+    const expected = "FSM(num_states=8, start=0, end=[0, 1, 2, 5, 6], edges=[" ++
+        "\n0: [[\\0-g]->0, 'h'->1, [i-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n1: [[\\0-d]->0, 'e'->2, [f-g]->0, 'h'->1, 'i'->4, [j-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n2: [[\\0-g]->0, 'h'->1, [i-k]->0, 'l'->3, [m-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n3: [Rule(1)->0]" ++
+        "\n4: [Rule(2)->0]" ++
+        "\n5: [[\\0-g]->0, 'h'->1, [i-\\x92]->0, '\\x93'->6, [\\x94-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n6: [[\\0-g]->0, 'h'->1, [i-\\x87]->0, '\\x88'->7, [\\x89-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n7: [Rule(3)->0]" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
-test "test_byte_string_rule_ref_character_class_fsm_builder_skipped_until_functor" {
-    // GrammarFsmBuilder::byte_string / rule_ref / character_class oracles (functor wave).
-    return error.SkipZigTest;
+test "test_tag_dispatch_fsm_builder2" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const td = try tag_dispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, false, &.{});
+    const fsm_opt = try GrammarFsmBuilder.tag_dispatch(a, &td);
+    const fsm = fsm_opt.?;
+    const expected = "FSM(num_states=11, start=0, end=[0, 1, 2, 5, 6, 8, 9, 10], edges=[" ++
+        "\n0: [[\\0-g]->0, 'h'->1, [i-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n1: [[\\0-d]->0, 'e'->2, [f-g]->0, 'h'->1, 'i'->4, [j-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n2: [[\\0-g]->0, 'h'->1, [i-k]->0, 'l'->3, [m-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n3: [Rule(1)->8]" ++
+        "\n4: [Rule(2)->9]" ++
+        "\n5: [[\\0-g]->0, 'h'->1, [i-\\x92]->0, '\\x93'->6, [\\x94-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n6: [[\\0-g]->0, 'h'->1, [i-\\x87]->0, '\\x88'->7, [\\x89-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
+        "\n7: [Rule(3)->10]" ++
+        "\n8: []" ++
+        "\n9: []" ++
+        "\n10: []" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
-test "test_sequence_and_choices_fsm_builder_skipped_until_functor" {
-    // GrammarFsmBuilder::choices over Grammar rules (functor wave).
-    return error.SkipZigTest;
+test "test_tag_dispatch_fsm_builder3" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const td = try tag_dispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, true, &.{ "hos", "eos" });
+    const fsm_opt = try GrammarFsmBuilder.tag_dispatch(a, &td);
+    const fsm = fsm_opt.?;
+    const printed = try fsm.to_string_repr();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Rule(1)->0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Rule(2)->0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Rule(3)->0") != null);
 }
 
-test "test_regex_build_with_forbidden_chars_skipped_until_functor" {
-    // Needs GrammarFsmBuilder::json_string_forbidden_chars (functor wave).
-    return error.SkipZigTest;
+test "test_token_tag_dispatch_fsm_builder" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    var ttd = TokenTagDispatch.empty();
+    try ttd.trigger_rule_pairs.append(a, .{ .token_id = 3, .rule_id = 1 });
+    try ttd.trigger_rule_pairs.append(a, .{ .token_id = 5, .rule_id = 2 });
+    ttd.loop_after_dispatch = false;
+    try ttd.excludes.append(a, 7);
+    var fsm = try GrammarFsmBuilder.token_tag_dispatch(a, &ttd);
+    const printed = try fsm.to_string_repr();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Token(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "ExcludeToken(") != null);
 }
 
-test "test_regex_build_with_forbidden_chars_preserves_repeat_aux_data_skipped_until_functor" {
-    // Needs GrammarFsmBuilder::json_string_forbidden_chars (functor wave).
-    return error.SkipZigTest;
+test "test_byte_string_fsm_builder1" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const data = [_]i32{ 'h', 'e', 'l', 'l', 'o' };
+    const expr = GrammarExpr{ .ty = .ByteString, .data = &data };
+    var fsm = try GrammarFsmBuilder.byte_string(a, expr);
+    const expected = "FSM(num_states=6, start=0, end=[5], edges=[" ++
+        "\n0: ['h'->1]" ++
+        "\n1: ['e'->2]" ++
+        "\n2: ['l'->3]" ++
+        "\n3: ['l'->4]" ++
+        "\n4: ['o'->5]" ++
+        "\n5: []" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
-test "test_grammar_fsm_builder_regex_skipped_until_functor" {
-    // GrammarFsmBuilder::regex (functor wave).
-    return error.SkipZigTest;
+test "test_byte_string_fsm_builder2" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    var data: std.ArrayList(i32) = .empty;
+    for ("你好") |byte| try data.append(a, byte);
+    const expr = GrammarExpr{ .ty = .ByteString, .data = data.items };
+    var fsm = try GrammarFsmBuilder.byte_string(a, expr);
+    const expected = "FSM(num_states=7, start=0, end=[6], edges=[" ++
+        "\n0: ['\\xe4'->1]" ++
+        "\n1: ['\\xbd'->2]" ++
+        "\n2: ['\\xa0'->3]" ++
+        "\n3: ['\\xe5'->4]" ++
+        "\n4: ['\\xa5'->5]" ++
+        "\n5: ['\\xbd'->6]" ++
+        "\n6: []" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "test_rule_ref_fsm_builder" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const data = [_]i32{1};
+    const expr = GrammarExpr{ .ty = .RuleRef, .data = &data };
+    var fsm = try GrammarFsmBuilder.rule_ref(a, expr);
+    const expected = "FSM(num_states=2, start=0, end=[1], edges=[" ++
+        "\n0: [Rule(1)->1]" ++
+        "\n1: []" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "test_character_class_fsm_builder1" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const data = [_]i32{ 0, 'a', 'z', 'A', 'Z' };
+    const expr = GrammarExpr{ .ty = .CharacterClass, .data = &data };
+    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    const expected = "FSM(num_states=2, start=0, end=[1], edges=[" ++
+        "\n0: [[a-z]->1, [A-Z]->1]" ++
+        "\n1: []" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "test_character_class_fsm_builder2" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const data = [_]i32{ 0, 'a', 'z', 'A', 'Z' };
+    const expr = GrammarExpr{ .ty = .CharacterClassStar, .data = &data };
+    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    const expected = "FSM(num_states=1, start=0, end=[0], edges=[" ++
+        "\n0: [[a-z]->0, [A-Z]->0]" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "test_character_class_fsm_builder3" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const data = [_]i32{ 1, 'a', 'z', 'A', 'Z' };
+    const expr = GrammarExpr{ .ty = .CharacterClass, .data = &data };
+    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    const expected = "FSM(num_states=16, start=0, end=[1], edges=[" ++
+        "\n0: [[\\0-@]->1, [[-`]->1, [{-\\x7f]->1, [\\xc2-\\xdf]->2, '\\xe0'->3, [\\xe1-\\xef]->5, '\\xf0'->7, '\\xf4'->10, [\\xf1-\\xf3]->13]" ++
+        "\n1: []" ++
+        "\n2: [[\\x80-\\xbf]->1]" ++
+        "\n3: [[\\xa0-\\xbf]->4]" ++
+        "\n4: [[\\x80-\\xbf]->1]" ++
+        "\n5: [[\\x80-\\xbf]->6]" ++
+        "\n6: [[\\x80-\\xbf]->1]" ++
+        "\n7: [[\\x90-\\xbf]->8]" ++
+        "\n8: [[\\x80-\\xbf]->9]" ++
+        "\n9: [[\\x80-\\xbf]->1]" ++
+        "\n10: [[\\x80-\\x8f]->11]" ++
+        "\n11: [[\\x80-\\xbf]->12]" ++
+        "\n12: [[\\x80-\\xbf]->1]" ++
+        "\n13: [[\\x80-\\xbf]->14]" ++
+        "\n14: [[\\x80-\\xbf]->15]" ++
+        "\n15: [[\\x80-\\xbf]->1]" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "test_character_class_fsm_builder4" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const data = [_]i32{ 1, 'a', 'z', 'A', 'Z' };
+    const expr = GrammarExpr{ .ty = .CharacterClassStar, .data = &data };
+    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    const expected = "FSM(num_states=15, start=0, end=[0], edges=[" ++
+        "\n0: [[\\0-@]->0, [[-`]->0, [{-\\x7f]->0, [\\xc2-\\xdf]->1, '\\xe0'->2, [\\xe1-\\xef]->4, '\\xf0'->6, '\\xf4'->9, [\\xf1-\\xf3]->12]" ++
+        "\n1: [[\\x80-\\xbf]->0]" ++
+        "\n2: [[\\xa0-\\xbf]->3]" ++
+        "\n3: [[\\x80-\\xbf]->0]" ++
+        "\n4: [[\\x80-\\xbf]->5]" ++
+        "\n5: [[\\x80-\\xbf]->0]" ++
+        "\n6: [[\\x90-\\xbf]->7]" ++
+        "\n7: [[\\x80-\\xbf]->8]" ++
+        "\n8: [[\\x80-\\xbf]->0]" ++
+        "\n9: [[\\x80-\\x8f]->10]" ++
+        "\n10: [[\\x80-\\xbf]->11]" ++
+        "\n11: [[\\x80-\\xbf]->0]" ++
+        "\n12: [[\\x80-\\xbf]->13]" ++
+        "\n13: [[\\x80-\\xbf]->14]" ++
+        "\n14: [[\\x80-\\xbf]->0]" ++
+        "\n])";
+    const actual = try fsm.to_string_repr();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "test_sequence_fsm_builder" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: @import("../parser/ebnf_error.zig").EbnfErrorInfo = undefined;
+    const grammar = try functor_mod.grammar_normalizer_mod.from_ebnf(
+        a,
+        "root ::= rule1 rule2 rule3\n" ++
+            "rule1 ::= \"a\" [a-z]* rule3\n" ++
+            "rule2 ::= \"c\" [A-Z] rule3\n" ++
+            "rule3 ::= \"a\" rule3\n",
+        "root",
+        &diag,
+    );
+
+    const root = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.root_rule().body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=4, start=2, end=[3], edges=[" ++
+            "\n0: [Rule(2)->1]" ++
+            "\n1: [Rule(3)->3]" ++
+            "\n2: [Rule(1)->0]" ++
+            "\n3: []" ++
+            "\n])",
+        try root.to_string_repr(),
+    );
+
+    const rule1 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(1).body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=3, start=1, end=[2], edges=[" ++
+            "\n0: [Rule(3)->2, [a-z]->0]" ++
+            "\n1: ['a'->0]" ++
+            "\n2: []" ++
+            "\n])",
+        try rule1.to_string_repr(),
+    );
+
+    const rule2 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(2).body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=4, start=2, end=[3], edges=[" ++
+            "\n0: [[A-Z]->1]" ++
+            "\n1: [Rule(3)->3]" ++
+            "\n2: ['c'->0]" ++
+            "\n3: []" ++
+            "\n])",
+        try rule2.to_string_repr(),
+    );
+
+    const rule3 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(3).body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=3, start=1, end=[2], edges=[" ++
+            "\n0: [Rule(3)->2]" ++
+            "\n1: ['a'->0]" ++
+            "\n2: []" ++
+            "\n])",
+        try rule3.to_string_repr(),
+    );
+}
+
+test "test_choices_fsm_builder" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: @import("../parser/ebnf_error.zig").EbnfErrorInfo = undefined;
+    const grammar = try functor_mod.grammar_normalizer_mod.from_ebnf(
+        a,
+        "root ::= rule1 | rule2\n" ++
+            "rule1 ::= \"\" | \"hello\" rule2\n" ++
+            "rule2 ::= [a-z]* \"A\" | \"B\" rule2\n",
+        "root",
+        &diag,
+    );
+
+    const root = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.root_rule().body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=3, start=0, end=[1, 2], edges=[" ++
+            "\n0: [Rule(1)->1, Rule(2)->2]" ++
+            "\n1: []" ++
+            "\n2: []" ++
+            "\n])",
+        try root.to_string_repr(),
+    );
+
+    const rule1 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(1).body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=7, start=0, end=[0, 6], edges=[" ++
+            "\n0: ['h'->2]" ++
+            "\n1: [Rule(2)->6]" ++
+            "\n2: ['e'->3]" ++
+            "\n3: ['l'->4]" ++
+            "\n4: ['l'->5]" ++
+            "\n5: ['o'->1]" ++
+            "\n6: []" ++
+            "\n])",
+        try rule1.to_string_repr(),
+    );
+
+    const rule2 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(2).body_expr_id), grammar);
+    try std.testing.expectEqualStrings(
+        "FSM(num_states=4, start=1, end=[0], edges=[" ++
+            "\n0: []" ++
+            "\n1: [Eps->2, 'B'->3]" ++
+            "\n2: ['A'->0, [a-z]->2]" ++
+            "\n3: [Rule(2)->0]" ++
+            "\n])",
+        try rule2.to_string_repr(),
+    );
+}
+
+test "test_regex_build_with_forbidden_chars" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // \S matches any non-whitespace byte. With the JSON forbidden characters removed, the
+    // quote and the backslash must be rejected while other printable characters stay.
+    const forbidden = GrammarFsmBuilder.json_string_forbidden_chars();
+    const T = struct {
+        fn buildForbidden(al: A, regex: []const u8) !FsmWithStartEnd {
+            return RegexFsmBuilder.build_with_forbidden_chars(al, regex, GrammarFsmBuilder.json_string_forbidden_chars(), null, "", null);
+        }
+    };
+    _ = forbidden;
+    var m1 = try T.buildForbidden(a, "\\S+");
+    try std.testing.expect(try m1.accept_string("abc"));
+    try std.testing.expect(try m1.accept_string("a!~z"));
+    try std.testing.expect(!try m1.accept_string("a\"b"));
+    try std.testing.expect(!try m1.accept_string("a\\b"));
+    try std.testing.expect(!try m1.accept_string("a b"));
+
+    // A positive class spanning the quote and the backslash is split around them.
+    var m2 = try T.buildForbidden(a, "[ -~]+");
+    try std.testing.expect(try m2.accept_string("A z!"));
+    try std.testing.expect(!try m2.accept_string("\""));
+    try std.testing.expect(!try m2.accept_string("\\"));
+
+    // . matches any byte; the control characters must be rejected as well.
+    var m3 = try T.buildForbidden(a, ".");
+    try std.testing.expect(try m3.accept_string("a"));
+    try std.testing.expect(!try m3.accept_string("\t"));
+    try std.testing.expect(!try m3.accept_string("\n"));
+    try std.testing.expect(!try m3.accept_string("\""));
+
+    // Epsilon transitions are preserved: the pattern still accepts the empty string.
+    var m4 = try T.buildForbidden(a, "(ab)*");
+    try std.testing.expect(try m4.accept_string(""));
+    try std.testing.expect(try m4.accept_string("abab"));
+    try std.testing.expect(!try m4.accept_string("a"));
+
+    // A pattern that requires a forbidden character becomes the empty language.
+    var m5 = try T.buildForbidden(a, "a\"b");
+    try std.testing.expect(!try m5.accept_string("a\"b"));
+    try std.testing.expect(!try m5.accept_string("ab"));
+    try std.testing.expect(!try m5.accept_string(""));
+
+    // Multi-byte UTF-8 characters (bytes >= 0x80) are not affected by the JSON exclusion.
+    var m6 = try T.buildForbidden(a, ".+");
+    try std.testing.expect(try m6.accept_string("你好"));
+}
+
+test "test_regex_build_with_forbidden_chars_preserves_repeat_aux_data" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    var builder = try grammar_mod.GrammarBuilder.new(a);
+
+    var m = try RegexFsmBuilder.build_with_forbidden_chars(a, "[^\n\r]{1,129}", GrammarFsmBuilder.json_string_forbidden_chars(), &builder, "", null);
+    const fsm = m.get_fsm();
+    const aux_data = fsm.edge_aux_data_slice();
+    try std.testing.expect(aux_data.len != 0);
+
+    var found_repeat_edge = false;
+    for (0..@intCast(fsm.num_states())) |state| {
+        for (fsm.state_edges(@intCast(state))) |edge| {
+            if (!edge.is_repeat_ref()) continue;
+            found_repeat_edge = true;
+            try std.testing.expect(edge.aux_index() >= 0);
+            try std.testing.expect(edge.aux_index() + 2 < @as(i32, @intCast(aux_data.len)));
+
+            const repeat_info = fsm.repeat_edge_info(edge.aux_index());
+            try std.testing.expectEqual(@as(i32, 1), repeat_info.lower());
+            try std.testing.expectEqual(@as(i32, 129), repeat_info.upper());
+        }
+    }
+    try std.testing.expect(found_repeat_edge);
+}
+
+test "test_grammar_fsm_builder_regex" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // The compiled regex automaton must preserve the language after simplification.
+    var m1 = try GrammarFsmBuilder.regex(a, "(ab)+", false, null);
+    try std.testing.expect(!try m1.accept_string(""));
+    try std.testing.expect(!try m1.accept_string("a"));
+    try std.testing.expect(try m1.accept_string("ab"));
+    try std.testing.expect(try m1.accept_string("abab"));
+
+    var m2 = try GrammarFsmBuilder.regex(a, "[0-9]{5}$", false, null);
+    try std.testing.expect(try m2.accept_string("12345"));
+    try std.testing.expect(!try m2.accept_string("1234"));
+    try std.testing.expect(!try m2.accept_string("123456"));
+
+    // json_string excludes the JSON forbidden characters.
+    var m3 = try GrammarFsmBuilder.regex(a, "\\S+", true, null);
+    try std.testing.expect(try m3.accept_string("abc"));
+    try std.testing.expect(!try m3.accept_string("a\"b"));
+    try std.testing.expect(!try m3.accept_string("a\\b"));
+
+    // Without the flag, the quote is accepted.
+    var m4 = try GrammarFsmBuilder.regex(a, "\\S+", false, null);
+    try std.testing.expect(try m4.accept_string("a\"b"));
+
+    // Invalid patterns report an error.
+    try std.testing.expectError(error.RegexParse, GrammarFsmBuilder.regex(a, "+a", false, null));
 }

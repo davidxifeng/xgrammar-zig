@@ -172,6 +172,7 @@ pub fn deserialize_compact_fsm_with_start_end_json_value(allocator: Allocator, v
     const fsm = try deserialize_compact_fsm_json_value(allocator, arr.items[0]);
     const start = try i32_of(arr.items[1]);
     const ends = try deserialize_i32_array(allocator, arr.items[2]);
+    defer allocator.free(ends);
     const is_dfa = switch (arr.items[3]) {
         .bool => |b| b,
         else => return format_error(), // expected is_dfa boolean

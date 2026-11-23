@@ -203,7 +203,7 @@ pub const GrammarFsmBuilder = struct {
     pub fn token_tag_dispatch(allocator: Allocator, ttd: *const TokenTagDispatch) Allocator.Error!FsmWithStartEnd {
         var fsm = try Fsm.new(allocator, 1);
         errdefer fsm.deinit();
-        const ends = try build_token_tag_dispatch(&fsm, ttd, 0);
+        var ends = try build_token_tag_dispatch(&fsm, ttd, 0);
         defer ends.deinit(allocator);
         return FsmWithStartEnd.new(allocator, fsm, 0, ends, false);
     }
@@ -295,9 +295,9 @@ pub const GrammarFsmBuilder = struct {
             RegexFsmBuilder.build_with_forbidden_chars(gpa, regex_pattern, json_string_forbidden_chars(), null, "", err_msg)
         else
             RegexFsmBuilder.build(gpa, regex_pattern, null, "", err_msg);
-        const built = result catch |err| return err;
+        var built = result catch |err| return err;
         defer built.deinit();
-        const simplified = try built.simplify_epsilon(gpa);
+        var simplified = try built.simplify_epsilon(gpa);
         defer simplified.deinit();
         return simplified.merge_equivalent_states(gpa);
     }

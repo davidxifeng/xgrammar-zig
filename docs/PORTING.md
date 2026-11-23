@@ -242,6 +242,10 @@
      消息文本丢弃;JSON Value 无递归释放,序列化往返测试用 arena。
    - merge_equivalent_states 的 EndpointEdge CSR 行显式零默认(init_from_row_sizes 需 default)。
    - spec 测试:test_fsm.rs 全量译入 spec_test_fsm.zig;test_fsm_builder.rs 译入
-     spec_test_fsm_builder.zig(其中 GrammarFsmBuilder 相关 7 组用例与
-     test_regular_grammar_fsm.rs 全部 4 组用例依赖 functor/matcher 波,译好并 gating 为
-     `error.SkipZigTest`,functor 落地后去掉 gating)。
+     spec_test_fsm_builder.zig(全 12 组断言实跑,functor 接线后已解除 gating;
+     tag_dispatch/character_class 等按参照逐字 FSM 串对比);
+     test_regular_grammar_fsm.rs 全部 4 组译好、gating 为 `error.SkipZigTest`
+     —— 解除条件:待 matcher 波(Wave E;regex-fallback 组另需 converter 波的 from_regex)。
+   - functor 接线时发现的两处 const 修正(编译期阻塞,fsm 波代办,语义不变):
+     grammar_fsm_builder.zig token_tag_dispatch 的 `ends` 与 regex 的 `built`/`simplified`
+     需 `var`(errdefer deinit 要求可变指针)。
