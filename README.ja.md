@@ -83,36 +83,9 @@ zig-out/bin/xgrammar-oracle < case.json > actual.json
 
 ## ベンチマーク（Zig vs Rust）
 
-同一ワークロードを用いて、**`xgrammar-zig`**（`tools/bench.zig`）と **`xgrammar-rs 0.2.8`**（`tools/oracle-rs/src/bin/bench.rs`）のベンチマークを計測しました。
+Apple M3（`arm64`、Zig `0.17.1 -Doptimize=ReleaseFast` vs `xgrammar-rs 0.2.8 --release`）にて 32K 語彙・ネスト JSON Schema・4 ルール EBNF・33 トークンデコードトレースで並列計測しました（整合性チェックサム完全一致：`bitmask_checksum = 9170455314173489972`）：
 
-- **計測環境**: Apple M3（8 コア、`arm64`）、macOS 27.0.1、Zig `0.17.1`（`-Doptimize=ReleaseFast`）、`rustc 1.99.1 (58cf8f9c3 2026-10-13)`（`--release`）
-- **ワークロード**: 32,000 トークン `.Raw` 語彙、ネストされた JSON Schema（`user` / `tags` / `score`）、4 ルール再帰算術 EBNF 文法、33 トークン JSON デコードトレース
-- **サンプリング条件**: 初期化・コンパイル項目はウォームアップ 1 回 + 本計測 5 回、ビットマスク生成と E2E デコードはウォームアップ 5 回 + 33 トークンパス 50 回、`b=1` ロジットマスク適用はウォームアップ 20 回 + 200×25 回、`b=4` バッチ適用はウォームアップ 10 回 + 100×10 回
-- **整合性検証**: 両実装で完全一致の結果を確認済み（`vocab_size = 32000`、`accepted_count = 33`、`bitmask_checksum = 9170455314173489972`）
+- **トークン単位のデコード（`fill + apply + accept`）**：Zig **`2.30 µs/tok`** vs Rust `13.89 µs/tok`（**6.03x 高速**）。マスク生成は同等（`1.48 µs` vs `1.38 µs`）、`@Vector(8, f32)` SIMD ロジットマスク適用が **7.62x–7.91x 高速**（`b=1` `1.76 µs`、`b=4` `6.80 µs`）です。
+- **初期化とコールドコンパイル**：参照カウント共有 `TokenizerInfo`（`cloneShared()`）の導入で毎コンパイルの 32K 語彙ディープコピーを撤廃した結果、EBNF 単スレッドコンパイルは `407.00 µs` から **`35.00 µs`** へ短縮し Rust（`60.17 µs`）より **1.72x 高速**になりました。32K 語彙初期化（`5.30 ms` vs `2.92 ms`）および JSON Schema コンパイル（4 スレッド `3.38 ms` vs `2.71 ms`）では現時点で Rust が高速です。
 
-| ベンチマーク項目 | Rust 中央値 (µs) | Zig 中央値 (µs) | 高速化倍率 (Rust / Zig) | Rust 平均値 (µs) | Zig 平均値 (µs) |
-|---|---:|---:|---:|---:|---:|
-| `TokenizerInfo` 初期化（32K 語彙） | 2978.58 | 5197.00 | 0.57x | 3101.83 | 5195.60 |
-| JSON Schema コンパイル（1 スレッド） | 3190.21 | 5369.00 | 0.59x | 3247.83 | 5346.40 |
-| JSON Schema コンパイル（4 スレッド） | 2605.33 | 3414.00 | 0.76x | 2629.80 | 3408.00 |
-| EBNF コンパイル（1 スレッド） | 55.88 | 407.00 | 0.14x | 60.11 | 409.00 |
-| `fill_next_token_bitmask`（32K、1 トークン） | 1.35 | 1.42 | 0.94x | 1.37 | 1.45 |
-| `apply_token_bitmask_inplace`（32K、`b=1`） | 13.25 | 1.72 | **7.70x** | 13.60 | 1.72 |
-| `apply_token_bitmask_inplace_batch`（128K、`b=4`） | 52.73 | 6.50 | **8.11x** | 53.88 | 6.66 |
-| E2E デコード: fill + apply + accept（32K、1 トークン） | 13.52 | 2.03 | **6.66x** | 13.83 | 2.04 |
-
-**結果の要約:**
-- **トークンごとのデコードホットパス**では、Zig はビットマスク生成で Rust と同等（`1.42 µs` vs `1.35 µs`）、`@Vector(8, f32)` SIMD によるロジットマスク適用で **7.70x–8.11x 高速**、結果として **E2E デコード全体で 6.66x 高速**（`2.03 µs/tok` vs `13.52 µs/tok`）になりました。
-- **初回初期化とコールドコンパイル**では、現時点で Rust の方が高速です（32K 語彙初期化・JSON Schema コンパイルで 1.3x–1.7x、小規模 EBNF コンパイルで 7.3x）。なお、`TokenizerInfo` 内の `std.sort.insertion` を `std.mem.sortUnstable` に置き換えたことで、Zig の 32K 語彙初期化は約 1.79 s から 5.20 ms まで高速化されました。
-
-### ベンチマークの再実行手順
-
-```sh
-# Zig ReleaseFast ベンチマークのビルドと実行
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/xgrammar-bench
-
-# Rust (xgrammar-rs 0.2.8) Release ベンチマークのビルドと実行
-cargo build --manifest-path tools/oracle-rs/Cargo.toml --release --bin bench
-tools/oracle-rs/target/release/bench
-```
+全計測表、最適化段階ごとの履歴、設計トレードオフ、再実行手順は [docs/BENCHMARKS.md](docs/BENCHMARKS.md) を参照してください。

@@ -42,12 +42,20 @@ pub const SortedDecodedToken = struct {
     token: []const u8,
 };
 
+const TokenizerStorage = struct {
+    refs: std.atomic.Value(usize),
+    arena: std.heap.ArenaAllocator,
+};
+
 /// The tokenizer info contains the vocabulary, the type of the vocabulary, and necessary
 /// information for grammar-guided generation.
+///
+/// The backing storage arena is reference-counted so `cloneShared()` is O(1) zero-copy.
+/// The parent allocator that constructed the original `TokenizerInfo` must outlive all
+/// shared handles (and callers must balance each `cloneShared()` with `deinit()`).
+/// Use `deepClone(allocator)` when copying into an independent allocator lifetime.
 pub const TokenizerInfo = struct {
-    /// Every top-level object holds its own arena; all internal data is allocated from it.
-    /// Heap-allocated so the constructor can hand a stable mutable pointer.
-    arena: *std.heap.ArenaAllocator,
+    storage: *TokenizerStorage,
 
     vocab_type: VocabType,
     vocab_size: i32,
@@ -64,18 +72,36 @@ pub const TokenizerInfo = struct {
     max_token_chars: i32,
 
     pub fn deinit(self: *TokenizerInfo) void {
-        const parent = self.arena.child_allocator;
-        self.arena.deinit();
-        parent.destroy(self.arena);
+        if (self.storage.refs.fetchSub(1, .acq_rel) == 1) {
+            const parent = self.storage.arena.child_allocator;
+            self.storage.arena.deinit();
+            parent.destroy(self.storage);
+        }
     }
 
-    /// Deep-copies `self` into an independent `ArenaAllocator` backed by `allocator`.
-    pub fn clone(self: *const TokenizerInfo, allocator: Allocator) Allocator.Error!TokenizerInfo {
-        const arena = try allocator.create(std.heap.ArenaAllocator);
-        errdefer allocator.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
+    /// Returns a zero-copy handle sharing the underlying ref-counted storage.
+    /// Caller must ensure the original allocator outlives all shared handles and call
+    /// `deinit()` on each shared handle.
+    pub fn cloneShared(self: *const TokenizerInfo) TokenizerInfo {
+        _ = self.storage.refs.fetchAdd(1, .monotonic);
+        return self.*;
+    }
+
+    /// Returns `true` when `self` and `other` reference the same backing storage.
+    pub fn sharesStorage(self: *const TokenizerInfo, other: *const TokenizerInfo) bool {
+        return self.storage == other.storage;
+    }
+
+    /// Deep-copies `self` into an independent ref-counted storage backed by `allocator`.
+    pub fn deepClone(self: *const TokenizerInfo, allocator: Allocator) Allocator.Error!TokenizerInfo {
+        const storage = try allocator.create(TokenizerStorage);
+        errdefer allocator.destroy(storage);
+        storage.* = .{
+            .refs = std.atomic.Value(usize).init(1),
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
+        errdefer storage.arena.deinit();
+        const a = storage.arena.allocator();
 
         const decoded_copy = try a.alloc([]const u8, self.decoded_vocab.len);
         for (self.decoded_vocab, 0..) |bytes, i| {
@@ -91,7 +117,7 @@ pub const TokenizerInfo = struct {
         }
 
         return .{
-            .arena = arena,
+            .storage = storage,
             .vocab_type = self.vocab_type,
             .vocab_size = self.vocab_size,
             .add_prefix_space = self.add_prefix_space,
@@ -104,6 +130,11 @@ pub const TokenizerInfo = struct {
             .token_char_counts = try a.dupe(i32, self.token_char_counts),
             .max_token_chars = self.max_token_chars,
         };
+    }
+
+    /// Deep-copies `self` into an independent ref-counted storage backed by `allocator`.
+    pub fn clone(self: *const TokenizerInfo, allocator: Allocator) Allocator.Error!TokenizerInfo {
+        return self.deepClone(allocator);
     }
 
     pub const InitOptions = struct {
@@ -161,12 +192,6 @@ pub const TokenizerInfo = struct {
         add_prefix_space: bool,
         diag: ?*TokenizerErrorInfo,
     ) TokenizerError!TokenizerInfo {
-        const arena = try allocator.create(std.heap.ArenaAllocator);
-        errdefer allocator.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-
         const size: i32 = vocab_size orelse @intCast(encoded_vocab.len);
         // vocab_size only ever pads the encoded vocab with special ids; a smaller value would
         // leave token ids without a slot.
@@ -177,14 +202,38 @@ pub const TokenizerInfo = struct {
             } });
             return error.VocabSizeTooSmall;
         }
-        var decoded_vocab = std.array_list.Managed([]const u8).init(a);
-        var sorted_decoded_vocab = std.array_list.Managed(SortedDecodedToken).init(a);
+
+        const storage = try allocator.create(TokenizerStorage);
+        errdefer allocator.destroy(storage);
+        storage.* = .{
+            .refs = std.atomic.Value(usize).init(1),
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
+        errdefer storage.arena.deinit();
+        const a = storage.arena.allocator();
+
+        const decoded_vocab = try a.alloc([]const u8, encoded_vocab.len);
+        var sorted_decoded_vocab = try std.array_list.Managed(SortedDecodedToken).initCapacity(a, encoded_vocab.len);
         var stop_ids = std.array_list.Managed(i32).init(a);
         var special_ids = std.array_list.Managed(i32).init(a);
 
+        // Pack `.Raw` tokens into one contiguous slab to avoid per-token arena allocations.
+        var raw_slab: []u8 = &.{};
+        var raw_cursor: usize = 0;
+        if (vocab == .Raw and encoded_vocab.len > 0) {
+            var total_bytes: usize = 0;
+            for (encoded_vocab) |encoded| total_bytes += encoded.len;
+            raw_slab = try a.alloc(u8, total_bytes);
+        }
+
         for (encoded_vocab, 0..) |encoded, i| {
             const id: i32 = @intCast(i);
-            const token = try token_decoder.decode_token_bytes(a, encoded, vocab);
+            const token: []const u8 = if (vocab == .Raw) blk: {
+                const dst = raw_slab[raw_cursor .. raw_cursor + encoded.len];
+                @memcpy(dst, encoded);
+                raw_cursor += encoded.len;
+                break :blk dst;
+            } else try token_decoder.decode_token_bytes(a, encoded, vocab);
             const is_stop = if (stop_token_ids == null)
                 blk: {
                     for (DETECTION_STOP_TOKENS) |s| {
@@ -204,13 +253,17 @@ pub const TokenizerInfo = struct {
                 // The only special token is the empty decoded token.
                 try special_ids.append(id);
             } else {
-                try sorted_decoded_vocab.append(.{ .id = id, .token = token });
+                sorted_decoded_vocab.appendAssumeCapacity(.{ .id = id, .token = token });
             }
-            try decoded_vocab.append(token);
+            decoded_vocab[i] = token;
         }
-        var padded: i32 = @intCast(encoded_vocab.len);
-        while (padded < size) : (padded += 1) {
-            try special_ids.append(padded);
+        const pad_count: usize = @intCast(size - @as(i32, @intCast(encoded_vocab.len)));
+        if (pad_count > 0) {
+            try special_ids.ensureUnusedCapacity(pad_count);
+            var padded: i32 = @intCast(encoded_vocab.len);
+            while (padded < size) : (padded += 1) {
+                special_ids.appendAssumeCapacity(padded);
+            }
         }
 
         // Sort by decoded bytes in O(N log N), breaking ties by `id` to match Rust's stable `sort_by`.
@@ -223,15 +276,15 @@ pub const TokenizerInfo = struct {
                 };
             }
         }.lessThan);
-        const trie_ranges = try build_trie_ranges(a, sorted_decoded_vocab.items);
+        const trie_ranges = try build_trie_ranges(a, allocator, sorted_decoded_vocab.items);
 
-        return with_derived_data(arena, vocab, size, add_prefix_space, try decoded_vocab.toOwnedSlice(), try sorted_decoded_vocab.toOwnedSlice(), trie_ranges, try stop_ids.toOwnedSlice(), try special_ids.toOwnedSlice());
+        return with_derived_data(storage, vocab, size, add_prefix_space, decoded_vocab, try sorted_decoded_vocab.toOwnedSlice(), trie_ranges, try stop_ids.toOwnedSlice(), try special_ids.toOwnedSlice());
     }
 
     /// Assembles tokenizer info and builds the derived per-token arrays (the reverse index and
     /// the codepoint counts), which are not serialized.
     fn with_derived_data(
-        arena: *std.heap.ArenaAllocator,
+        storage: *TokenizerStorage,
         vocab: VocabType,
         size: i32,
         prefix_space: bool,
@@ -241,7 +294,7 @@ pub const TokenizerInfo = struct {
         stop_token_ids: []const i32,
         special_token_ids: []const i32,
     ) TokenizerInfo {
-        const a = arena.allocator();
+        const a = storage.arena.allocator();
         const token_id_to_sorted_vocab_index = a.alloc(i32, @intCast(size)) catch @panic("OOM");
         @memset(token_id_to_sorted_vocab_index, -1);
         for (sorted_decoded_vocab, 0..) |entry, i| {
@@ -258,7 +311,7 @@ pub const TokenizerInfo = struct {
             if (count > max_token_chars) max_token_chars = count;
         }
         return .{
-            .arena = arena,
+            .storage = storage,
             .vocab_type = vocab,
             .vocab_size = size,
             .add_prefix_space = prefix_space,
@@ -354,8 +407,8 @@ pub const TokenizerInfo = struct {
 
     /// Dumps the tokenizer metadata as a compact JSON string for compiled-grammar checks.
     /// Caller owns the returned memory.
-    pub fn dump_metadata(self: *TokenizerInfo, allocator: Allocator) error{OutOfMemory}![]u8 {
-        return json_stringify(allocator, metadata_value_into(self.arena.allocator(), self) catch return error.OutOfMemory);
+    pub fn dump_metadata(self: *const TokenizerInfo, allocator: Allocator) error{OutOfMemory}![]u8 {
+        return self.dumpMetadata(allocator);
     }
 
     // --- Idiomatic Zig 0.17 accessors ---
@@ -394,7 +447,7 @@ pub const TokenizerInfo = struct {
     /// Returns tokenizer metadata as a JSON object (serde_json key order: sorted).
     /// Built inside the info's own arena; the returned `std.json.Value` borrows it.
     pub fn metadata_value(self: *TokenizerInfo) std.json.Value {
-        return metadata_value_into(self.arena.allocator(), self) catch @panic("OOM");
+        return metadata_value_into(self.storage.arena.allocator(), self) catch @panic("OOM");
     }
 
     pub fn metadata_value_into(a: Allocator, self: *const TokenizerInfo) error{OutOfMemory}!std.json.Value {
@@ -623,12 +676,15 @@ pub const TokenizerInfo = struct {
             }
         }
 
-        // Copy the validated fields into the info's own arena.
-        const arena = try allocator.create(std.heap.ArenaAllocator);
-        errdefer allocator.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
+        // Copy the validated fields into the info's own ref-counted storage.
+        const storage = try allocator.create(TokenizerStorage);
+        errdefer allocator.destroy(storage);
+        storage.* = .{
+            .refs = std.atomic.Value(usize).init(1),
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
+        errdefer storage.arena.deinit();
+        const a = storage.arena.allocator();
         const decoded_copy = try a.alloc([]const u8, decoded_vocab.len);
         for (decoded_vocab, 0..) |bytes, i| decoded_copy[i] = try a.dupe(u8, bytes);
         const sorted_copy = try a.alloc(SortedDecodedToken, sorted_decoded_vocab.len);
@@ -636,7 +692,7 @@ pub const TokenizerInfo = struct {
             sorted_copy[i] = .{ .id = entry.id, .token = try a.dupe(u8, entry.token) };
         }
         return with_derived_data(
-            arena,
+            storage,
             vocab,
             size,
             prefix_space,
@@ -729,11 +785,16 @@ fn byte_contains(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Builds the pseudo-trie subtree ranges over the sorted vocabulary.
-fn build_trie_ranges(a: Allocator, sorted: []const SortedDecodedToken) error{OutOfMemory}![]const i32 {
-    const ranges = try a.alloc(i32, sorted.len);
+/// Allocates `ranges` from `out_alloc` and temporary stack storage from `scratch_alloc`.
+fn build_trie_ranges(
+    out_alloc: Allocator,
+    scratch_alloc: Allocator,
+    sorted: []const SortedDecodedToken,
+) error{OutOfMemory}![]const i32 {
+    const ranges = try out_alloc.alloc(i32, sorted.len);
     @memset(ranges, 0);
     // Sorted indices of the currently-active prefixes.
-    var prefix_stack = std.array_list.Managed(usize).init(a);
+    var prefix_stack = std.array_list.Managed(usize).init(scratch_alloc);
     defer prefix_stack.deinit();
     for (sorted, 0..) |entry, i| {
         while (prefix_stack.items.len > 0) {
@@ -901,4 +962,25 @@ test "detect_metadata_from_hf wrapper" {
     const json = try TokenizerInfo.detect_metadata_from_hf(a, "{\"decoder\":{\"type\":\"ByteLevel\"}}");
     defer a.free(json);
     try std.testing.expectEqualStrings("{\"add_prefix_space\":false,\"vocab_type\":2}", json);
+}
+
+test "cloneShared shares ref-counted storage and deepClone decouples" {
+    const a = std.testing.allocator;
+    var original = try TokenizerInfo.new(a, &.{ "alpha", "beta", "</s>" }, .Raw, null, null, false, null);
+    var shared_a = original.cloneShared();
+    var shared_b = shared_a.cloneShared();
+    try std.testing.expect(original.sharesStorage(&shared_a));
+    try std.testing.expect(shared_a.sharesStorage(&shared_b));
+
+    var deep = try original.deepClone(a);
+    try std.testing.expect(!original.sharesStorage(&deep));
+    try std.testing.expectEqualStrings("alpha", shared_b.decoded_vocab[0]);
+    try std.testing.expectEqualStrings("beta", deep.decoded_vocab[1]);
+
+    // Drop original before shared handles; backing arena survives until last ref drops.
+    original.deinit();
+    shared_a.deinit();
+    try std.testing.expectEqualStrings("beta", shared_b.decoded_vocab[1]);
+    shared_b.deinit();
+    deep.deinit();
 }

@@ -147,7 +147,7 @@ pub const GrammarCompiler = struct {
         } else null;
         errdefer if (rlc) |c| c.deinit();
 
-        var tok_copy = try tokenizer.clone(allocator);
+        var tok_copy = tokenizer.cloneShared();
         errdefer tok_copy.deinit();
 
         const self = try allocator.create(GrammarCompiler);

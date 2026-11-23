@@ -83,36 +83,9 @@ zig-out/bin/xgrammar-oracle < case.json > actual.json
 
 ## 性能基准测试（Zig vs Rust）
 
-在相同工作负载下对 **`xgrammar-zig`**（`tools/bench.zig`）与 **`xgrammar-rs 0.2.8`**（`tools/oracle-rs/src/bin/bench.rs`）进行了并排基准测试。
+在 Apple M3（`arm64`，Zig `0.17.1 -Doptimize=ReleaseFast` vs `xgrammar-rs 0.2.8 --release`）上基于 32K 词表、嵌套 JSON Schema、4 规则 EBNF 与 33-token 解码轨迹进行了同负载并排测试（输出校验和一致：`bitmask_checksum = 9170455314173489972`）：
 
-- **测试环境**：Apple M3（8 核，`arm64`），macOS 27.0.1，Zig `0.17.1`（`-Doptimize=ReleaseFast`），`rustc 1.99.1 (58cf8f9c3 2026-10-13)`（`--release`）
-- **测试负载**：32,000 token `.Raw` 词表、嵌套 JSON Schema（`user` / `tags` / `score`）、4 规则递归算术 EBNF 文法，以及 33 token 的 JSON 解码轨迹
-- **采样方式**：初始化/编译类测试为 1 次预热 + 5 次正式测量；掩码生成与端到端解码为 5 次预热 + 50 轮 33-token 轨迹；`b=1` logits 掩码应用为 20 次预热 + 200×25 次调用；`b=4` 批处理掩码应用为 10 次预热 + 100×10 次调用
-- **一致性校验**：两侧输出的验证结果完全一致：`vocab_size = 32000`、`accepted_count = 33`、`bitmask_checksum = 9170455314173489972`
+- **单步解码热路径（`fill + apply + accept`）**：Zig 为 **`2.30 µs/tok`**，Rust 为 `13.89 µs/tok`（**快 6.03x**）；掩码生成基本持平（`1.48 µs` vs `1.38 µs`），基于 `@Vector(8, f32)` SIMD 的 logits 掩码应用速度是 Rust 的 **7.62x–7.91x**（`b=1` `1.76 µs`，`b=4` `6.80 µs`）。
+- **冷启动与编译路径**：引入 `TokenizerInfo` 引用计数共享（`cloneShared()`）并消除每次编译深拷贝 32K 词表后，Zig 单线程 EBNF 编译耗时从 `407.00 µs` 降至 **`35.00 µs`**（Rust `60.17 µs`，**反超 1.72x**）；32K 词表初始化（`5.30 ms` vs `2.92 ms`）与 JSON Schema 编译（4 线程 `3.38 ms` vs `2.71 ms`）目前仍由 Rust 领先。
 
-| 基准项 | Rust 中位数 (µs) | Zig 中位数 (µs) | 加速比 (Rust / Zig) | Rust 均值 (µs) | Zig 均值 (µs) |
-|---|---:|---:|---:|---:|---:|
-| `TokenizerInfo` 初始化（32K 词表） | 2978.58 | 5197.00 | 0.57x | 3101.83 | 5195.60 |
-| 编译 JSON Schema（单线程） | 3190.21 | 5369.00 | 0.59x | 3247.83 | 5346.40 |
-| 编译 JSON Schema（4 线程） | 2605.33 | 3414.00 | 0.76x | 2629.80 | 3408.00 |
-| 编译 EBNF（单线程） | 55.88 | 407.00 | 0.14x | 60.11 | 409.00 |
-| `fill_next_token_bitmask`（32K，单 token） | 1.35 | 1.42 | 0.94x | 1.37 | 1.45 |
-| `apply_token_bitmask_inplace`（32K，`b=1`） | 13.25 | 1.72 | **7.70x** | 13.60 | 1.72 |
-| `apply_token_bitmask_inplace_batch`（128K，`b=4`） | 52.73 | 6.50 | **8.11x** | 53.88 | 6.66 |
-| 端到端解码：fill + apply + accept（32K，单 token） | 13.52 | 2.03 | **6.66x** | 13.83 | 2.04 |
-
-**结论分析：**
-- 在**单步解码热路径**上，Zig 的掩码生成速度与 Rust 持平（`1.42 µs` vs `1.35 µs`），基于 `@Vector(8, f32)` SIMD 的 logits 掩码应用速度是 Rust 的 **7.70x–8.11x**，使端到端单 token 解码速度达到 Rust 的 **6.66x**（`2.03 µs/tok` vs `13.52 µs/tok`）。
-- 在**一次性初始化与冷编译路径**上，目前 Rust 更快（32K 词表初始化与 JSON Schema 编译快 1.3x–1.7x，小型 EBNF 编译快 7.3x）。在本次基准测试中，将 `TokenizerInfo` 中的 `std.sort.insertion` 替换为 `std.mem.sortUnstable` 后，32K 词表初始化耗时已从约 1.79 s 降至 5.20 ms。
-
-### 复现基准测试
-
-```sh
-# 编译并运行 Zig ReleaseFast 基准测试
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/xgrammar-bench
-
-# 编译并运行 Rust (xgrammar-rs 0.2.8) Release 基准测试
-cargo build --manifest-path tools/oracle-rs/Cargo.toml --release --bin bench
-tools/oracle-rs/target/release/bench
-```
+完整对比表格、各优化阶段的历史数据、原因/权衡分析及复现命令详见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。

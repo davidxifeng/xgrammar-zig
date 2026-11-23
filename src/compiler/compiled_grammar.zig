@@ -108,7 +108,7 @@ pub const CompiledGrammar = struct {
         rl_cache: ?*RuleLevelCache,
     ) Allocator.Error!CompiledGrammar {
         errdefer grammar_ptr.deinit();
-        var tok_copy = try tokenizer.clone(allocator);
+        var tok_copy = tokenizer.cloneShared();
         errdefer tok_copy.deinit();
         var cache = try build_adaptive_token_mask_cache(
             allocator,
@@ -258,7 +258,7 @@ pub const CompiledGrammar = struct {
             }
         }
 
-        var tok_copy = try tokenizer.clone(allocator);
+        var tok_copy = tokenizer.cloneShared();
         errdefer tok_copy.deinit();
         return CompiledGrammar.new(allocator, g, tok_copy, cache);
     }
