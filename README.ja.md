@@ -91,3 +91,19 @@ Apple M3（`arm64`、Zig `0.17.1 -Doptimize=ReleaseFast` vs `xgrammar-rs 0.2.8 -
 - **初期化とコールドコンパイル**：256 バケット MSD 基数パーティションにより 32K `TokenizerInfo.init` を **`4.43 ms`** へ短縮（Stage 2 比 16.3% 改善）、`EarleyParser` 再利用により JSON Schema コンパイルを **`4.88 ms`（1t）/ `3.22 ms`（4t）** へ改善し、EBNF 単スレッドコンパイルは **`43.00 µs`**（最小 `35.00 µs`）vs Rust `58.42 µs`（**1.36x 高速**）を達成しました。
 
 Stage 0 → Stage 3 の全計測表と再現手順は [docs/BENCHMARKS.md](docs/BENCHMARKS.md) を参照してください。
+
+## AI エージェント向けドキュメント（Agent Skill）
+
+本リポジトリには AI コーディングエージェント向けの自己完結型ドキュメントと動作確認済み Zig レシピが含まれており、エージェントは **`src/` のソースコードを読まずに** `xgrammar` を正しく統合・利用できます：
+
+- **リポジトリ共通ガイド**：[AGENTS.md](AGENTS.md)
+- **Agent Skill エントリーポイント**：[.agents/skills/xgrammar-zig/SKILL.md](.agents/skills/xgrammar-zig/SKILL.md)
+- **公開 API リファレンス**：[.agents/skills/xgrammar-zig/references/api-reference.md](.agents/skills/xgrammar-zig/references/api-reference.md)
+- **入力文法フォーマット仕様**：[.agents/skills/xgrammar-zig/references/grammar-formats.md](.agents/skills/xgrammar-zig/references/grammar-formats.md)
+- **実行可能な Zig レシピ集**：[.agents/skills/xgrammar-zig/examples/recipes.zig](.agents/skills/xgrammar-zig/examples/recipes.zig)
+
+別プロジェクトのコーディングエージェントにも同じ知識を共有するには、Skill フォルダをコピーしてください：
+
+```sh
+cp -r .agents/skills/xgrammar-zig /path/to/your-project/.agents/skills/
+```

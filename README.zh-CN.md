@@ -91,3 +91,19 @@ zig-out/bin/xgrammar-oracle < case.json > actual.json
 - **初始化与冷编译路径**：256 桶 MSD 基数分桶排序将 32K `TokenizerInfo.init` 降至 **`4.43 ms`**（较 Stage 2 提速 16.3%），状态复用缓存构建将 JSON Schema 冷编译降至 **`4.88 ms`（1 线程）/ `3.22 ms`（4 线程）**，单线程 EBNF 冷编译为 **`43.00 µs`**（最低 `35.00 µs`），快于 Rust `58.42 µs`（**1.36x**）。
 
 完整 Stage 0 → Stage 3 对比数据与分析详见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
+
+## 面向 AI Agents（Agent Skill 文档）
+
+本仓库内置面向 AI 编程助手的完整文档与可运行测试示例，使 Agent **无需阅读 `src/` 源码** 即可正确集成并调用 `xgrammar`：
+
+- **仓库入口指引**：[AGENTS.md](AGENTS.md)
+- **Agent Skill 主文档**：[.agents/skills/xgrammar-zig/SKILL.md](.agents/skills/xgrammar-zig/SKILL.md)
+- **完整公开 API 参考**：[.agents/skills/xgrammar-zig/references/api-reference.md](.agents/skills/xgrammar-zig/references/api-reference.md)
+- **输入语法格式手册**：[.agents/skills/xgrammar-zig/references/grammar-formats.md](.agents/skills/xgrammar-zig/references/grammar-formats.md)
+- **可运行 Zig 示例代码**：[.agents/skills/xgrammar-zig/examples/recipes.zig](.agents/skills/xgrammar-zig/examples/recipes.zig)
+
+若要在下游 Zig 项目中复用该 Skill，可直接复制到目标仓库：
+
+```sh
+cp -r .agents/skills/xgrammar-zig /path/to/your-project/.agents/skills/
+```

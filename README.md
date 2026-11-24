@@ -91,3 +91,19 @@ Measured side-by-side on Apple M3 (`arm64`, Zig `0.17.1 -Doptimize=ReleaseFast` 
 - **Init & compilation**: 256-bucket radix vocab partitioning cuts 32K `TokenizerInfo.init` to **`4.43 ms`** (down 16.3% from Stage 2 `5.30 ms`), reused `EarleyParser` mask builders cut cold JSON Schema compilation to **`4.88 ms` (1t) / `3.22 ms` (4t)**, and cold 1t EBNF compilation runs in **`43.00 µs`** (`35.00 µs` min) vs Rust `58.42 µs` (**1.36x faster**).
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full Stage 0 → Stage 3 tables, methodology, and reproduction commands.
+
+## For AI Agents (Agent Skill)
+
+This repository includes self-contained agent documentation and tested Zig examples so AI coding agents can use `xgrammar` correctly without reading `src/`:
+
+- **Repository instructions**: [AGENTS.md](AGENTS.md)
+- **Skill entry point**: [.agents/skills/xgrammar-zig/SKILL.md](.agents/skills/xgrammar-zig/SKILL.md)
+- **Complete API reference**: [.agents/skills/xgrammar-zig/references/api-reference.md](.agents/skills/xgrammar-zig/references/api-reference.md)
+- **Supported grammar formats**: [.agents/skills/xgrammar-zig/references/grammar-formats.md](.agents/skills/xgrammar-zig/references/grammar-formats.md)
+- **Runnable Zig recipes**: [.agents/skills/xgrammar-zig/examples/recipes.zig](.agents/skills/xgrammar-zig/examples/recipes.zig)
+
+To give agents in a downstream project the same knowledge automatically:
+
+```sh
+cp -r .agents/skills/xgrammar-zig /path/to/your-project/.agents/skills/
+```
