@@ -34,10 +34,10 @@ const FIXED_TOKENS = [_][]const u8{
     "</s>",
 };
 
-const TRACE_IDS = [TRACE_LEN]i32{
-    0,  7,  4,  0,  8,  4,  9,  5,  10, 4, 11,
-    5,  12, 4,  13, 5,  19, 4,  20, 1,  5, 14,
-    4,  2,  15, 5,  16, 3,  5,  17, 4,  18, 1,
+const TRACE_IDS = [TRACE_LEN]u32{
+    0, 7,  4,  0,  8,  4,  9, 5,  10, 4,  11,
+    5, 12, 4,  13, 5,  19, 4, 20, 1,  5,  14,
+    4, 2,  15, 5,  16, 3,  5, 17, 4,  18, 1,
 };
 
 const JSON_SCHEMA =
@@ -115,11 +115,11 @@ pub fn main(init: std.process.Init) !void {
     // 1. TokenizerInfo init on 32K vocab
     var tok_samples: [5]u64 = undefined;
     {
-        var warm = try xgrammar.TokenizerInfo.new(gpa, vocab.slices, .Raw, null, &.{24}, false, null);
+        var warm = try xgrammar.TokenizerInfo.init(gpa, vocab.slices, .{ .stop_token_ids = &.{24} });
         warm.deinit();
         for (&tok_samples) |*slot| {
             const t0 = nowNs();
-            var ti = try xgrammar.TokenizerInfo.new(gpa, vocab.slices, .Raw, null, &.{24}, false, null);
+            var ti = try xgrammar.TokenizerInfo.init(gpa, vocab.slices, .{ .stop_token_ids = &.{24} });
             const t1 = nowNs();
             ti.deinit();
             slot.* = t1 - t0;
@@ -127,19 +127,19 @@ pub fn main(init: std.process.Init) !void {
     }
     const tok_stats = computeStats(&tok_samples, 1.0);
 
-    var tok = try xgrammar.TokenizerInfo.new(gpa, vocab.slices, .Raw, null, &.{24}, false, null);
+    var tok = try xgrammar.TokenizerInfo.init(gpa, vocab.slices, .{ .stop_token_ids = &.{24} });
     defer tok.deinit();
 
     // 2. Cold JSON Schema compilation (max_threads = 1)
     var json_1t_samples: [5]u64 = undefined;
     {
-        const c1 = try xgrammar.GrammarCompiler.new(gpa, &tok, 1, false, -1);
+        var c1 = try xgrammar.GrammarCompiler.init(gpa, &tok, .{ .max_threads = 1, .cache_enabled = false });
         defer c1.deinit();
-        var warm = try c1.compile_json_schema(JSON_SCHEMA, true, null, null, true, null, null);
+        var warm = try c1.compileJsonSchema(JSON_SCHEMA, .{ .strict_mode = true });
         warm.deinit();
         for (&json_1t_samples) |*slot| {
             const t0 = nowNs();
-            var cg = try c1.compile_json_schema(JSON_SCHEMA, true, null, null, true, null, null);
+            var cg = try c1.compileJsonSchema(JSON_SCHEMA, .{ .strict_mode = true });
             const t1 = nowNs();
             cg.deinit();
             slot.* = t1 - t0;
@@ -150,13 +150,13 @@ pub fn main(init: std.process.Init) !void {
     // 3. Cold JSON Schema compilation (max_threads = 4)
     var json_4t_samples: [5]u64 = undefined;
     {
-        const c4 = try xgrammar.GrammarCompiler.new(gpa, &tok, 4, false, -1);
+        var c4 = try xgrammar.GrammarCompiler.init(gpa, &tok, .{ .max_threads = 4, .cache_enabled = false });
         defer c4.deinit();
-        var warm = try c4.compile_json_schema(JSON_SCHEMA, true, null, null, true, null, null);
+        var warm = try c4.compileJsonSchema(JSON_SCHEMA, .{ .strict_mode = true });
         warm.deinit();
         for (&json_4t_samples) |*slot| {
             const t0 = nowNs();
-            var cg = try c4.compile_json_schema(JSON_SCHEMA, true, null, null, true, null, null);
+            var cg = try c4.compileJsonSchema(JSON_SCHEMA, .{ .strict_mode = true });
             const t1 = nowNs();
             cg.deinit();
             slot.* = t1 - t0;
@@ -167,13 +167,13 @@ pub fn main(init: std.process.Init) !void {
     // 4. Cold EBNF compilation (max_threads = 1)
     var ebnf_1t_samples: [5]u64 = undefined;
     {
-        const c1 = try xgrammar.GrammarCompiler.new(gpa, &tok, 1, false, -1);
+        var c1 = try xgrammar.GrammarCompiler.init(gpa, &tok, .{ .max_threads = 1, .cache_enabled = false });
         defer c1.deinit();
-        var warm = try c1.compile_grammar_ebnf(EBNF_GRAMMAR, "root", null);
+        var warm = try c1.compileEbnf(EBNF_GRAMMAR, .{});
         warm.deinit();
         for (&ebnf_1t_samples) |*slot| {
             const t0 = nowNs();
-            var cg = try c1.compile_grammar_ebnf(EBNF_GRAMMAR, "root", null);
+            var cg = try c1.compileEbnf(EBNF_GRAMMAR, .{});
             const t1 = nowNs();
             cg.deinit();
             slot.* = t1 - t0;
@@ -182,20 +182,18 @@ pub fn main(init: std.process.Init) !void {
     const ebnf_1t_stats = computeStats(&ebnf_1t_samples, 1.0);
 
     // Compile JSON Schema once for matcher & bitmask benchmarks.
-    const comp = try xgrammar.GrammarCompiler.new(gpa, &tok, 4, false, -1);
+    var comp = try xgrammar.GrammarCompiler.init(gpa, &tok, .{ .max_threads = 4, .cache_enabled = false });
     defer comp.deinit();
-    var compiled = try comp.compile_json_schema(JSON_SCHEMA, true, null, null, true, null, null);
+    var compiled = try comp.compileJsonSchema(JSON_SCHEMA, .{ .strict_mode = true });
     defer compiled.deinit();
 
-    var matcher = try xgrammar.GrammarMatcher.from_compiled_grammar(gpa, &compiled, false);
+    var matcher = try xgrammar.GrammarMatcher.init(gpa, &compiled, .{});
     defer matcher.deinit();
 
-    const bm_size = xgrammar.get_bitmask_size(tok.vocab_size);
-    const shape = [2]i64{ 1, bm_size };
-    const bitmask = try xgrammar.allocate_token_bitmask(gpa, 1, tok.vocab_size);
-    defer gpa.free(bitmask);
+    var bitmask = try xgrammar.TokenBitmask.initSingle(gpa, tok.vocabSize());
+    defer bitmask.deinit();
 
-    // 5. fill_next_token_bitmask + accept_token (33 tokens per pass)
+    // 5. fillNextTokenBitmask + acceptToken (33 tokens per pass)
     var fill_samples: [50]u64 = undefined;
     var fill_checksum: u64 = 0;
     var accepted_count: usize = 0;
@@ -205,11 +203,12 @@ pub fn main(init: std.process.Init) !void {
         var local_hash: u64 = 0;
         var local_acc: usize = 0;
         for (TRACE_IDS) |tid| {
-            _ = try matcher.fill_next_token_bitmask(bitmask, &shape, 0, null);
-            for (bitmask) |w| {
+            bitmask.reset();
+            _ = try matcher.fillNextTokenBitmask(&bitmask, 0, null);
+            for (bitmask.words) |w| {
                 local_hash = (local_hash *% 1099511628211) ^ @as(u32, @bitCast(w));
             }
-            if (try matcher.accept_token(tid)) local_acc += 1;
+            if (try matcher.acceptToken(tid, null)) local_acc += 1;
         }
         const t1 = nowNs();
         if (pass_idx >= 5) {
@@ -222,10 +221,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Prepare realistic bitmask from mid-generation step (after `{`) for logit apply bench.
     try matcher.reset();
-    _ = try matcher.accept_token(0);
-    _ = try matcher.fill_next_token_bitmask(bitmask, &shape, 0, null);
+    _ = try matcher.acceptToken(0, null);
+    bitmask.reset();
+    _ = try matcher.fillNextTokenBitmask(&bitmask, 0, null);
 
-    // 6. apply_token_bitmask_inplace_cpu on 32K logits (batch = 1)
+    // 6. applyToLogits on 32K logits (batch = 1)
     const logits_b1 = try gpa.alloc(f32, VOCAB_SIZE);
     defer gpa.free(logits_b1);
     var apply_b1_samples: [200]u64 = undefined;
@@ -234,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
         const t0 = nowNs();
         var k: usize = 0;
         while (k < 25) : (k += 1) {
-            xgrammar.apply_token_bitmask_inplace_cpu(logits_b1, bitmask, tok.vocab_size);
+            bitmask.applyToLogits(logits_b1);
             std.mem.doNotOptimizeAway(logits_b1.ptr);
         }
         const t1 = nowNs();
@@ -244,11 +244,11 @@ pub fn main(init: std.process.Init) !void {
     }
     const apply_b1_stats = computeStats(&apply_b1_samples, 25.0);
 
-    // 7. apply_token_bitmask_inplace_cpu_batch on 4x32K = 128K logits (batch = 4)
-    const batch4_bm = try xgrammar.allocate_token_bitmask(gpa, 4, tok.vocab_size);
-    defer gpa.free(batch4_bm);
+    // 7. applyBatchToLogits on 4x32K = 128K logits (batch = 4)
+    var batch4_bm = try xgrammar.TokenBitmask.init(gpa, 4, tok.vocabSize());
+    defer batch4_bm.deinit();
     for (0..4) |b| {
-        @memcpy(batch4_bm[b * @as(usize, @intCast(bm_size)) .. (b + 1) * @as(usize, @intCast(bm_size))], bitmask);
+        @memcpy(batch4_bm.row(b), bitmask.words);
     }
     const logits_b4 = try gpa.alloc(f32, 4 * VOCAB_SIZE);
     defer gpa.free(logits_b4);
@@ -258,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
         const t0 = nowNs();
         var k: usize = 0;
         while (k < 10) : (k += 1) {
-            xgrammar.apply_token_bitmask_inplace_cpu_batch(logits_b4, batch4_bm, tok.vocab_size, 4, null);
+            batch4_bm.applyBatchToLogits(logits_b4, null);
             std.mem.doNotOptimizeAway(logits_b4.ptr);
         }
         const t1 = nowNs();
@@ -274,10 +274,11 @@ pub fn main(init: std.process.Init) !void {
         try matcher.reset();
         const t0 = nowNs();
         for (TRACE_IDS) |tid| {
-            _ = try matcher.fill_next_token_bitmask(bitmask, &shape, 0, null);
-            xgrammar.apply_token_bitmask_inplace_cpu(logits_b1, bitmask, tok.vocab_size);
+            bitmask.reset();
+            _ = try matcher.fillNextTokenBitmask(&bitmask, 0, null);
+            bitmask.applyToLogits(logits_b1);
             std.mem.doNotOptimizeAway(logits_b1.ptr);
-            _ = try matcher.accept_token(tid);
+            _ = try matcher.acceptToken(tid, null);
         }
         const t1 = nowNs();
         if (pass_idx >= 5) {
@@ -293,7 +294,7 @@ pub fn main(init: std.process.Init) !void {
     try jw.objectField("impl");
     try jw.write("xgrammar-zig");
     try jw.objectField("vocab_size");
-    try jw.write(tok.vocab_size);
+    try jw.write(tok.vocabSize());
     try jw.objectField("accepted_count");
     try jw.write(accepted_count);
     try jw.objectField("bitmask_checksum");

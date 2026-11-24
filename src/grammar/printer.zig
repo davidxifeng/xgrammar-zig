@@ -1,18 +1,15 @@
-//! EBNF printing for `Grammar` (`printer.rs`).
+//! Streaming EBNF printing for `Grammar` (zero heap allocation in `writeEbnf`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const grammar_mod = @import("grammar.zig");
+const grammar_mod = @import("Grammar.zig");
 const Grammar = grammar_mod.Grammar;
-const grammar_expr_mod = @import("grammar_expr.zig");
-const GrammarExpr = grammar_expr_mod.GrammarExpr;
-const grammar_expr_type = @import("grammar_expr_type.zig");
-const GrammarExprType = grammar_expr_type.GrammarExprType;
-const rule_mod = @import("rule.zig");
-const NO_EXPR = rule_mod.NO_EXPR;
-const support = @import("../support/mod.zig");
-const CodepointEscape = support.encoding.CodepointEscape;
+const NO_EXPR = grammar_mod.NO_EXPR;
+const dispatch = @import("dispatch.zig");
+const support = @import("../support.zig");
+const encoding = support.encoding;
+const CodepointEscape = encoding.CodepointEscape;
 
 /// Custom escapes used inside character classes: `-` and `]` are backslash-escaped.
 const CHAR_CLASS_ESCAPES = [_]CodepointEscape{
@@ -20,301 +17,321 @@ const CHAR_CLASS_ESCAPES = [_]CodepointEscape{
     .{ .codepoint = 0x5D, .escape = "\\]" },
 };
 
-/// Renders the grammar back to its normalized EBNF text (one rule per line)
-/// (Rust `Grammar::to_string_ebnf` / `Display`).
-pub fn to_string_ebnf(grammar: *const Grammar, allocator: Allocator) Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (0..@intCast(grammar.num_rules())) |rule_id| {
-        try print_rule(&out, allocator, grammar, @intCast(rule_id));
-        try out.append(allocator, '\n');
+/// Streams the grammar in normalized EBNF form (one rule per line) directly to `writer`
+/// with zero heap allocations.
+pub fn writeEbnf(grammar: *const Grammar, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (0..grammar.numRules()) |rule_id| {
+        try writeRule(grammar, writer, @intCast(rule_id));
+        try writer.writeByte('\n');
     }
-    return out.toOwnedSlice(allocator);
 }
 
-fn push_fmt(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
-    comptime fmt: []const u8,
-    args: anytype,
-) Allocator.Error!void {
-    const s = try std.fmt.allocPrint(allocator, fmt, args);
-    defer allocator.free(s);
-    try out.appendSlice(allocator, s);
+/// Renders the grammar back to its normalized EBNF text (`allocator`-owned slice).
+pub fn toStringEbnf(grammar: *const Grammar, allocator: Allocator) Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    writeEbnf(grammar, &aw.writer) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
 }
 
-fn print_rule(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
+fn writeAttrSep(writer: *std.Io.Writer, first: *bool) std.Io.Writer.Error!void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeAll(", ");
+    }
+}
+
+fn writeRule(
     grammar: *const Grammar,
+    writer: *std.Io.Writer,
     rule_id: i32,
-) Allocator.Error!void {
-    const rule = grammar.rule(rule_id);
-    const suffix_stop_info = grammar.suffix_stop_info(rule_id);
-    // Print the attributes as one comma-separated bracket group, re-parseable by the lexer.
-    var attributes: std.ArrayList(u8) = .empty;
-    defer attributes.deinit(allocator);
-    if (rule.max_tokens >= 0) {
-        try push_attribute(&attributes, allocator, "max_tokens={d}", .{rule.max_tokens});
-    }
-    if (rule.max_chars >= 0) {
-        try push_attribute(&attributes, allocator, "max_chars={d}", .{rule.max_chars});
-    }
-    if (rule.capture_name.len != 0) {
-        try push_attribute(&attributes, allocator, "capture=\"{s}\"", .{rule.capture_name});
-    }
-    if (suffix_stop_info) |info| {
-        if (info.hidden_suffix_bytes > 0) {
-            try push_attribute(&attributes, allocator, "capture_hidden_suffix_bytes={d}", .{info.hidden_suffix_bytes});
+) std.Io.Writer.Error!void {
+    const r = grammar.rule(rule_id);
+    const suffix_stop_info = grammar.suffixStopInfo(rule_id);
+
+    try writer.writeAll(r.name);
+    const has_attrs = suffix_stop_info != null or
+        r.max_tokens >= 0 or
+        r.max_chars >= 0 or
+        r.capture_name.len != 0 or
+        r.is_lazy or
+        r.temperature != null;
+    if (has_attrs) {
+        try writer.writeByte('[');
+        var first = true;
+        if (r.max_tokens >= 0) {
+            try writeAttrSep(writer, &first);
+            try writer.print("max_tokens={d}", .{r.max_tokens});
         }
-        if (info.hidden_stop_bytes > 0) {
-            try push_attribute(&attributes, allocator, "capture_hidden_stop_bytes={d}", .{info.hidden_stop_bytes});
+        if (r.max_chars >= 0) {
+            try writeAttrSep(writer, &first);
+            try writer.print("max_chars={d}", .{r.max_chars});
         }
-        if (info.body_rule_id >= 0) {
-            try push_attribute(&attributes, allocator, "capture_hidden_body_rule_id={d}", .{info.body_rule_id});
-            try push_attribute(&attributes, allocator, "capture_hidden_marker_rule_id={d}", .{info.marker_rule_id});
+        if (r.capture_name.len != 0) {
+            try writeAttrSep(writer, &first);
+            try writer.print("capture=\"{s}\"", .{r.capture_name});
         }
-        if (info.stop_capture_name.len != 0) {
-            try push_attribute(&attributes, allocator, "stop_capture=\"{s}\"", .{info.stop_capture_name});
+        if (suffix_stop_info) |info| {
+            if (info.hidden_suffix_bytes > 0) {
+                try writeAttrSep(writer, &first);
+                try writer.print("capture_hidden_suffix_bytes={d}", .{info.hidden_suffix_bytes});
+            }
+            if (info.hidden_stop_bytes > 0) {
+                try writeAttrSep(writer, &first);
+                try writer.print("capture_hidden_stop_bytes={d}", .{info.hidden_stop_bytes});
+            }
+            if (info.body_rule_id >= 0) {
+                try writeAttrSep(writer, &first);
+                try writer.print("capture_hidden_body_rule_id={d}", .{info.body_rule_id});
+                try writeAttrSep(writer, &first);
+                try writer.print("capture_hidden_marker_rule_id={d}", .{info.marker_rule_id});
+            }
+            if (info.stop_capture_name.len != 0) {
+                try writeAttrSep(writer, &first);
+                try writer.print("stop_capture=\"{s}\"", .{info.stop_capture_name});
+            }
         }
+        if (r.is_lazy) {
+            try writeAttrSep(writer, &first);
+            try writer.writeAll("lazy");
+        }
+        if (r.temperature) |temperature| {
+            try writeAttrSep(writer, &first);
+            try writer.writeAll("temperature=");
+            try writeFloatMaxDigits(writer, temperature);
+        }
+        try writer.writeByte(']');
     }
-    if (rule.is_lazy) {
-        try push_attribute(&attributes, allocator, "lazy", .{});
-    }
-    if (rule.temperature) |temperature| {
-        const formatted = try format_float_max_digits(allocator, temperature);
-        defer allocator.free(formatted);
-        try push_attribute(&attributes, allocator, "temperature={s}", .{formatted});
-    }
-    try out.appendSlice(allocator, rule.name);
-    if (suffix_stop_info != null or attributes.items.len != 0) {
-        try push_fmt(out, allocator, "[{s}]", .{attributes.items});
-    }
-    const body = try print_expr(allocator, grammar, rule.body_expr_id);
-    defer allocator.free(body);
-    try push_fmt(out, allocator, " ::= {s}", .{body});
-    if (rule.lookahead_assertion_id != NO_EXPR) {
-        const lookahead = try print_expr(allocator, grammar, rule.lookahead_assertion_id);
-        defer allocator.free(lookahead);
-        try push_fmt(out, allocator, " (={s})", .{lookahead});
+
+    try writer.writeAll(" ::= ");
+    try writeExpr(grammar, writer, r.body_expr_id);
+    if (r.lookahead_assertion_id != NO_EXPR) {
+        try writer.writeAll(" (=");
+        try writeExpr(grammar, writer, r.lookahead_assertion_id);
+        try writer.writeByte(')');
     }
 }
 
-fn push_attribute(
-    attributes: *std.ArrayList(u8),
-    allocator: Allocator,
-    comptime fmt: []const u8,
-    args: anytype,
-) Allocator.Error!void {
-    if (attributes.items.len != 0) try attributes.appendSlice(allocator, ", ");
-    const s = try std.fmt.allocPrint(allocator, fmt, args);
-    defer allocator.free(s);
-    try attributes.appendSlice(allocator, s);
+fn writeEscapedI32Bytes(writer: *std.Io.Writer, data: []const i32) std.Io.Writer.Error!void {
+    var i: usize = 0;
+    while (i < data.len) {
+        var buf: [4]u8 = undefined;
+        const avail = @min(4, data.len - i);
+        for (0..avail) |k| {
+            const v = data[i + k];
+            buf[k] = if (v >= 0 and v <= 255) @intCast(v) else 0xFF;
+        }
+        if (encoding.parseNextUtf8(buf[0..avail])) |decoded| {
+            try encoding.writeEscapedCodepoint(writer, decoded.codepoint, &.{});
+            i += decoded.consumed;
+        } else |_| {
+            try encoding.writeEscapedCodepoint(writer, data[i], &.{});
+            i += 1;
+        }
+    }
 }
 
-fn print_expr(
-    allocator: Allocator,
+fn writeQuotedI32Bytes(writer: *std.Io.Writer, data: []const i32) std.Io.Writer.Error!void {
+    try writer.writeByte('"');
+    try writeEscapedI32Bytes(writer, data);
+    try writer.writeByte('"');
+}
+
+fn writeExpr(
     grammar: *const Grammar,
+    writer: *std.Io.Writer,
     expr_id: i32,
-) Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+) std.Io.Writer.Error!void {
     const expr = grammar.expr(expr_id);
     switch (expr.ty) {
-        .ByteString => {
-            const bytes = try expr.byte_string(allocator);
-            defer allocator.free(bytes);
-            const escaped = try support.escape_bytes(allocator, bytes);
-            defer allocator.free(escaped);
-            try push_fmt(&out, allocator, "\"{s}\"", .{escaped});
-        },
-        .CharacterClass => try print_character_class(&out, allocator, grammar, expr_id, false),
-        .CharacterClassStar => try print_character_class(&out, allocator, grammar, expr_id, true),
-        .EmptyStr => try out.appendSlice(allocator, "\"\""),
-        .RuleRef => try out.appendSlice(allocator, grammar.rule(expr.rule_ref_id()).name),
-        .Sequence => try print_joined(&out, allocator, grammar, expr.data, " "),
-        .Choices => try print_joined(&out, allocator, grammar, expr.data, " | "),
-        .TagDispatch => try print_tag_dispatch(&out, allocator, grammar, expr_id),
+        .ByteString => try writeQuotedI32Bytes(writer, expr.data),
+        .CharacterClass => try writeCharacterClass(writer, expr.data, false),
+        .CharacterClassStar => try writeCharacterClass(writer, expr.data, true),
+        .EmptyStr => try writer.writeAll("\"\""),
+        .RuleRef => try writer.writeAll(grammar.rule(expr.ruleRefId()).name),
+        .Sequence => try writeJoined(grammar, writer, expr.data, " "),
+        .Choices => try writeJoined(grammar, writer, expr.data, " | "),
+        .TagDispatch => try writeTagDispatch(grammar, writer, expr.data),
         .Repeat => {
             const rep = expr.repeat();
-            try push_fmt(&out, allocator, "{s}{{{d}, {d}}}", .{ grammar.rule(rep.rule_id).name, rep.min_repeat, rep.max_repeat });
+            try writer.print("{s}{{{d}, {d}}}", .{ grammar.rule(rep.rule_id).name, rep.min_repeat, rep.max_repeat });
         },
-        .Token => try print_token_list(&out, allocator, "Token", expr.data),
-        .ExcludeToken => try print_token_list(&out, allocator, "ExcludeToken", expr.data),
-        .TokenTagDispatch => try print_token_tag_dispatch(&out, allocator, grammar, expr_id),
+        .Token => try writeTokenList(writer, "Token", expr.data),
+        .ExcludeToken => try writeTokenList(writer, "ExcludeToken", expr.data),
+        .TokenTagDispatch => try writeTokenTagDispatch(grammar, writer, expr.data),
         .Regex => {
-            const pattern = try expr.regex_pattern(allocator);
-            defer allocator.free(pattern);
-            const json_string: []const u8 = if (expr.regex_is_json_string()) ", json_string=true" else "";
-            const quoted = try print_quoted(allocator, pattern);
-            defer allocator.free(quoted);
-            try push_fmt(&out, allocator, "Regex({s}{s})", .{ quoted, json_string });
+            try writer.writeAll("Regex(");
+            try writeQuotedI32Bytes(writer, expr.data[1..]);
+            if (expr.regexIsJsonString()) try writer.writeAll(", json_string=true");
+            try writer.writeByte(')');
         },
         .Substring => {
-            const chunks = try expr.substring_chunks(allocator);
-            defer {
-                for (chunks) |chunk| allocator.free(chunk);
-                allocator.free(chunks);
+            try writer.writeAll("Substring(");
+            var index: usize = 0;
+            var first = true;
+            while (index < expr.data.len) {
+                const chunk_len: usize = @intCast(expr.data[index]);
+                index += 1;
+                if (!first) try writer.writeAll(", ");
+                first = false;
+                try writeQuotedI32Bytes(writer, expr.data[index..][0..chunk_len]);
+                index += chunk_len;
             }
-            try out.appendSlice(allocator, "Substring(");
-            for (chunks, 0..) |chunk, i| {
-                if (i > 0) try out.appendSlice(allocator, ", ");
-                const quoted = try print_quoted(allocator, chunk);
-                defer allocator.free(quoted);
-                try out.appendSlice(allocator, quoted);
-            }
-            try out.appendSlice(allocator, ")");
+            try writer.writeByte(')');
         },
     }
-    return out.toOwnedSlice(allocator);
 }
 
-fn print_joined(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
+fn writeJoined(
     grammar: *const Grammar,
+    writer: *std.Io.Writer,
     element_ids: []const i32,
     separator: []const u8,
-) Allocator.Error!void {
-    try out.append(allocator, '(');
+) std.Io.Writer.Error!void {
+    try writer.writeByte('(');
     for (element_ids, 0..) |id, i| {
-        if (i > 0) try out.appendSlice(allocator, separator);
-        const piece = try print_expr(allocator, grammar, id);
-        defer allocator.free(piece);
-        try out.appendSlice(allocator, piece);
+        if (i > 0) try writer.writeAll(separator);
+        try writeExpr(grammar, writer, id);
     }
-    try out.append(allocator, ')');
+    try writer.writeByte(')');
 }
 
-fn print_character_class(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
-    grammar: *const Grammar,
-    expr_id: i32,
+fn writeCharacterClass(
+    writer: *std.Io.Writer,
+    data: []const i32,
     star: bool,
-) Allocator.Error!void {
-    const class = try grammar.expr(expr_id).character_class(allocator);
-    defer allocator.free(class.ranges);
-    try out.append(allocator, '[');
-    if (class.is_negative) try out.append(allocator, '^');
-    for (class.ranges) |range| {
-        const lower = try support.escape_codepoint(allocator, range.lower, &CHAR_CLASS_ESCAPES);
-        defer allocator.free(lower);
-        try out.appendSlice(allocator, lower);
-        if (range.lower != range.upper) {
-            try out.append(allocator, '-');
-            const upper = try support.escape_codepoint(allocator, range.upper, &CHAR_CLASS_ESCAPES);
-            defer allocator.free(upper);
-            try out.appendSlice(allocator, upper);
+) std.Io.Writer.Error!void {
+    const is_negative = data[0] != 0;
+    const n = (data.len - 1) / 2;
+    try writer.writeByte('[');
+    if (is_negative) try writer.writeByte('^');
+    for (0..n) |i| {
+        const lower = data[1 + 2 * i];
+        const upper = data[2 + 2 * i];
+        try encoding.writeEscapedCodepoint(writer, lower, &CHAR_CLASS_ESCAPES);
+        if (lower != upper) {
+            try writer.writeByte('-');
+            try encoding.writeEscapedCodepoint(writer, upper, &CHAR_CLASS_ESCAPES);
         }
     }
-    try out.append(allocator, ']');
-    if (star) try out.append(allocator, '*');
+    try writer.writeByte(']');
+    if (star) try writer.writeByte('*');
 }
 
-fn print_token_list(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
+fn writeTokenList(
+    writer: *std.Io.Writer,
     label: []const u8,
     token_ids: []const i32,
-) Allocator.Error!void {
-    try push_fmt(out, allocator, "{s}(", .{label});
+) std.Io.Writer.Error!void {
+    try writer.print("{s}(", .{label});
     for (token_ids, 0..) |id, i| {
-        if (i > 0) try out.appendSlice(allocator, ", ");
-        try push_fmt(out, allocator, "{d}", .{id});
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print("{d}", .{id});
     }
-    try out.append(allocator, ')');
+    try writer.writeByte(')');
 }
 
-fn print_quoted(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
-    const escaped = try support.escape_bytes(allocator, bytes);
-    defer allocator.free(escaped);
-    return std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
-}
-
-fn print_tag_dispatch(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
+fn writeTagDispatch(
     grammar: *const Grammar,
-    expr_id: i32,
-) Allocator.Error!void {
-    var td = try @import("tag_dispatch.zig").tag_dispatch(grammar, allocator, expr_id);
-    defer td.deinit(allocator);
-    try out.appendSlice(allocator, "TagDispatch(\n");
-    for (td.tag_rule_pairs.items) |pair| {
-        const quoted = try print_quoted(allocator, pair.tag);
-        defer allocator.free(quoted);
-        try push_fmt(out, allocator, "  ({s}, {s}),\n", .{ quoted, grammar.rule(pair.rule_id).name });
+    writer: *std.Io.Writer,
+    data: []const i32,
+) std.Io.Writer.Error!void {
+    const body_len = data.len - dispatch.EXTRA_PARAMETERS;
+    try writer.writeAll("TagDispatch(\n");
+    for (0..body_len / 2) |pair_index| {
+        const pair = data[pair_index * 2 ..][0..2];
+        const tag_expr = grammar.expr(pair[0]);
+        std.debug.assert(tag_expr.ty == .ByteString);
+        try writer.writeAll("  (");
+        try writeQuotedI32Bytes(writer, tag_expr.data);
+        try writer.print(", {s}),\n", .{grammar.rule(pair[1]).name});
     }
-    try push_fmt(out, allocator, "  loop_after_dispatch={s},\n", .{bool_str(td.loop_after_dispatch)});
-    try out.appendSlice(allocator, "  excludes=(");
-    for (td.excludes.items, 0..) |exclude, i| {
-        if (i > 0) try out.appendSlice(allocator, ", ");
-        const quoted = try print_quoted(allocator, exclude);
-        defer allocator.free(quoted);
-        try out.appendSlice(allocator, quoted);
+    const loop_after_dispatch = data[data.len - 2] != 0;
+    try writer.print("  loop_after_dispatch={s},\n", .{boolStr(loop_after_dispatch)});
+    const exclude_expr = grammar.expr(data[data.len - 1]);
+    std.debug.assert(exclude_expr.ty == .Choices);
+    try writer.writeAll("  excludes=(");
+    for (exclude_expr.data, 0..) |child, i| {
+        if (i > 0) try writer.writeAll(", ");
+        const exc_expr = grammar.expr(child);
+        std.debug.assert(exc_expr.ty == .ByteString);
+        try writeQuotedI32Bytes(writer, exc_expr.data);
     }
-    try out.appendSlice(allocator, ")\n)");
+    try writer.writeAll(")\n)");
 }
 
-fn print_token_tag_dispatch(
-    out: *std.ArrayList(u8),
-    allocator: Allocator,
+fn writeTokenTagDispatch(
     grammar: *const Grammar,
-    expr_id: i32,
-) Allocator.Error!void {
-    var ttd = try @import("token_tag_dispatch.zig").token_tag_dispatch(grammar, allocator, expr_id);
-    defer ttd.deinit(allocator);
-    try out.appendSlice(allocator, "TokenTagDispatch(\n");
-    for (ttd.trigger_rule_pairs.items) |pair| {
-        try push_fmt(out, allocator, "  ({d}, {s}),\n", .{ pair.token_id, grammar.rule(pair.rule_id).name });
+    writer: *std.Io.Writer,
+    data: []const i32,
+) std.Io.Writer.Error!void {
+    var pos: usize = 0;
+    const trigger_count: usize = @intCast(data[pos]);
+    pos += 1;
+    try writer.writeAll("TokenTagDispatch(\n");
+    for (0..trigger_count) |_| {
+        const token_id = data[pos];
+        const rule_id = data[pos + 1];
+        pos += 2;
+        try writer.print("  ({d}, {s}),\n", .{ token_id, grammar.rule(rule_id).name });
     }
-    try push_fmt(out, allocator, "  loop_after_dispatch={s},\n", .{bool_str(ttd.loop_after_dispatch)});
-    try out.appendSlice(allocator, "  excludes=(");
-    for (ttd.excludes.items, 0..) |id, i| {
-        if (i > 0) try out.appendSlice(allocator, ", ");
-        try push_fmt(out, allocator, "{d}", .{id});
+    const loop_after_dispatch = data[pos] != 0;
+    pos += 1;
+    try writer.print("  loop_after_dispatch={s},\n", .{boolStr(loop_after_dispatch)});
+    const exclude_count: usize = @intCast(data[pos]);
+    pos += 1;
+    try writer.writeAll("  excludes=(");
+    for (0..exclude_count) |i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print("{d}", .{data[pos]});
+        pos += 1;
     }
-    try out.appendSlice(allocator, ")\n)");
+    try writer.writeAll(")\n)");
 }
 
-fn bool_str(b: bool) []const u8 {
+fn boolStr(b: bool) []const u8 {
     return if (b) "true" else "false";
 }
 
-/// Formats `value` like C++ `ostream << std::setprecision(max_digits10)` (i.e. `%.9g`)
-/// (`printer.rs::format_float_max_digits`).
-pub fn format_float_max_digits(allocator: Allocator, value_f32: f32) Allocator.Error![]u8 {
-    // std::numeric_limits<float>::max_digits10
+/// Streams `value_f32` like C++ `ostream << std::setprecision(max_digits10)` (i.e. `%.9g`)
+/// without heap allocation.
+pub fn writeFloatMaxDigits(writer: *std.Io.Writer, value_f32: f32) std.Io.Writer.Error!void {
     const PRECISION: usize = 9;
     const value: f64 = @floatCast(value_f32);
     if (value == 0.0 or !std.math.isFinite(value)) {
-        // Rust `format!("{value}")` spellings.
-        if (std.math.isNan(value)) return allocator.dupe(u8, "NaN");
-        if (std.math.isInf(value)) return allocator.dupe(u8, if (value < 0) "-inf" else "inf");
-        if (std.math.signbit(value)) return allocator.dupe(u8, "-0");
-        return allocator.dupe(u8, "0");
+        if (std.math.isNan(value)) return writer.writeAll("NaN");
+        if (std.math.isInf(value)) return writer.writeAll(if (value < 0) "-inf" else "inf");
+        if (std.math.signbit(value)) return writer.writeAll("-0");
+        return writer.writeAll("0");
     }
     var sci_buf: [std.fmt.float.bufferSize(.decimal, f64) + 32]u8 = undefined;
     const scientific = std.fmt.float.render(&sci_buf, value, .{ .mode = .scientific, .precision = PRECISION - 1 }) catch unreachable;
-    const e_pos = std.mem.indexOfScalar(u8, scientific, 'e') orelse unreachable; // scientific notation has an exponent
+    const e_pos = std.mem.indexOfScalar(u8, scientific, 'e') orelse unreachable;
     const exponent = std.fmt.parseInt(i32, scientific[e_pos + 1 ..], 10) catch unreachable;
     var mant_buf: [64]u8 = undefined;
-    const mantissa = strip_digits(&mant_buf, scientific[0..e_pos]);
+    const mantissa = stripDigits(&mant_buf, scientific[0..e_pos]);
     if (exponent >= -4 and exponent < @as(i32, @intCast(PRECISION))) {
         const decimals: usize = @intCast(@max(0, @as(i32, @intCast(PRECISION)) - 1 - exponent));
         var fix_buf: [std.fmt.float.bufferSize(.decimal, f64) + 32]u8 = undefined;
         const fixed = std.fmt.float.render(&fix_buf, value, .{ .mode = .decimal, .precision = decimals }) catch unreachable;
         var strip_buf: [256]u8 = undefined;
-        return allocator.dupe(u8, strip_digits(&strip_buf, fixed));
+        return writer.writeAll(stripDigits(&strip_buf, fixed));
     } else {
         const sign: u8 = if (exponent < 0) '-' else '+';
-        return std.fmt.allocPrint(allocator, "{s}e{c}{d:0>2}", .{ mantissa, sign, @abs(exponent) });
+        return writer.print("{s}e{c}{d:0>2}", .{ mantissa, sign, @abs(exponent) });
     }
 }
 
-/// Rust `strip`: trims trailing zeros and then a trailing decimal point.
-fn strip_digits(buf: []u8, digits: []const u8) []const u8 {
+/// Allocates and formats `value_f32` via `writeFloatMaxDigits`.
+pub fn formatFloatMaxDigits(allocator: Allocator, value_f32: f32) Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    writeFloatMaxDigits(&aw.writer, value_f32) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
+fn stripDigits(buf: []u8, digits: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, digits, '.') == null) {
         @memcpy(buf[0..digits.len], digits);
         return buf[0..digits.len];
@@ -326,40 +343,79 @@ fn strip_digits(buf: []u8, digits: []const u8) []const u8 {
     return buf[0..end];
 }
 
-test "format float max digits" {
+test "formatFloatMaxDigits" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { value: f32, want: []const u8 }{
-        .{ .value = 0.7, .want = "0.699999988" }, // 0.7f32 widened to f64
+        .{ .value = 0.7, .want = "0.699999988" },
         .{ .value = 1.0, .want = "1" },
         .{ .value = 0.5, .want = "0.5" },
-        .{ .value = 0.123456789, .want = "0.123456791" }, // f32 rounding, then %.9g
-        .{ .value = 123456792.0, .want = "123456792" }, // exponent 8 → decimal branch
-        .{ .value = 1e-5, .want = "9.99999975e-06" }, // exponent -5 → scientific branch
+        .{ .value = 0.123456789, .want = "0.123456791" },
+        .{ .value = 123456792.0, .want = "123456792" },
+        .{ .value = 1e-5, .want = "9.99999975e-06" },
         .{ .value = -2.5, .want = "-2.5" },
         .{ .value = 1000000.0, .want = "1000000" },
     };
     for (cases) |c| {
-        const got = try format_float_max_digits(gpa, c.value);
+        const got = try formatFloatMaxDigits(gpa, c.value);
         defer gpa.free(got);
         try std.testing.expectEqualStrings(c.want, got);
     }
 }
 
-test "to_string_ebnf basic grammar" {
+test "streaming writeEbnf and Grammar.format with zero temp heap allocations" {
     const backing = std.testing.allocator;
-    const grammar_builder_mod = @import("grammar_builder.zig");
-    var builder = try grammar_builder_mod.GrammarBuilder.new(backing);
+    const Builder = @import("Builder.zig").GrammarBuilder;
+    var builder = try Builder.init(backing);
     defer builder.deinit();
-    const char_class_id = try builder.add_character_class(&.{@import("character_class_element.zig").CharacterClassElement.new('a', 'z')}, false);
-    const bs_id = try builder.add_byte_string("b");
-    const seq_id = try builder.add_sequence(&.{ bs_id, char_class_id });
-    const empty_id = try builder.add_empty_str();
-    const choices_id = try builder.add_choices(&.{ seq_id, empty_id });
-    _ = try builder.add_rule_named("root", choices_id);
-    const grammar = try builder.into_grammar_with_root_id(backing, 0);
+
+    const cc_id = try builder.addCharacterClass(&.{grammar_mod.CharacterClassElement.init('a', 'z')}, false);
+    const bs_id = try builder.addByteString("b\n中");
+    const seq_id = try builder.addSequence(&.{ bs_id, cc_id });
+    const empty_id = try builder.addEmptyStr();
+    const rx_id = try builder.addRegex("[0-9]+", true);
+    const sub_id = try builder.addSubstring(&.{ "ab", "", "c" });
+    const tok_id = try builder.addTokenSet(&.{ 1, 2 });
+    const exc_id = try builder.addExcludeTokenSet(&.{9});
+    const choices_id = try builder.addChoices(&.{ seq_id, empty_id, rx_id, sub_id, tok_id, exc_id });
+    _ = try builder.addRuleNamed("root", choices_id);
+    var grammar = try builder.intoGrammarWithRootId(0);
     defer grammar.deinit();
 
-    const ebnf = try to_string_ebnf(grammar, backing);
-    defer backing.free(ebnf);
-    try std.testing.expectEqualStrings("root ::= ((\"b\" [a-z]) | \"\")\n", ebnf);
+    // Format directly into a fixed stack buffer — zero heap allocations!
+    var stack_buf: [1024]u8 = undefined;
+    var fixed_writer = std.Io.Writer.fixed(&stack_buf);
+    try fixed_writer.print("{f}", .{grammar});
+
+    const owned = try toStringEbnf(&grammar, backing);
+    defer backing.free(owned);
+    try std.testing.expectEqualStrings(owned, fixed_writer.buffered());
+    try std.testing.expectEqualStrings(
+        "root ::= ((\"b\\n\\u4e2d\" [a-z]) | \"\" | Regex(\"[0-9]+\", json_string=true) | Substring(\"ab\", \"\", \"c\") | Token(1, 2) | ExcludeToken(9))\n",
+        owned,
+    );
+
+    // Zero-alloc streaming also works for TagDispatch and TokenTagDispatch.
+    var b2 = try Builder.init(backing);
+    defer b2.deinit();
+    _ = try b2.addRuleNamed("r1", try b2.addByteString("a"));
+    var td = dispatch.TagDispatch.init();
+    defer td.deinit(backing);
+    try td.tag_rule_pairs.append(backing, .{ .tag = try backing.dupe(u8, "x"), .rule_id = 0 });
+    td.loop_after_dispatch = true;
+    try td.excludes.append(backing, try backing.dupe(u8, "z"));
+    const td_id = try b2.addTagDispatch(&td);
+    var ttd = dispatch.TokenTagDispatch.init();
+    defer ttd.deinit(backing);
+    try ttd.trigger_rule_pairs.append(backing, .{ .token_id = 5, .rule_id = 0 });
+    try ttd.excludes.append(backing, 8);
+    const ttd_id = try b2.addTokenTagDispatch(&ttd);
+    _ = try b2.addRuleNamed("root", try b2.addChoices(&.{ td_id, ttd_id }));
+    var g2 = try b2.intoGrammar("root", null);
+    defer g2.deinit();
+
+    var buf2: [1024]u8 = undefined;
+    var fw2 = std.Io.Writer.fixed(&buf2);
+    try fw2.print("{f}", .{g2});
+    try std.testing.expect(std.mem.indexOf(u8, fw2.buffered(), "TagDispatch(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fw2.buffered(), "TokenTagDispatch(") != null);
 }

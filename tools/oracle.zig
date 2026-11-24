@@ -88,9 +88,9 @@ fn utf8LossyAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
 }
 
 fn parseVocabType(s: []const u8) !xgrammar.VocabType {
-    if (std.mem.eql(u8, s, "raw")) return .Raw;
-    if (std.mem.eql(u8, s, "byte_fallback")) return .ByteFallback;
-    if (std.mem.eql(u8, s, "byte_level")) return .ByteLevel;
+    if (std.mem.eql(u8, s, "raw")) return .raw;
+    if (std.mem.eql(u8, s, "byte_fallback")) return .byte_fallback;
+    if (std.mem.eql(u8, s, "byte_level")) return .byte_level;
     return error.UnknownVocabType;
 }
 
@@ -127,20 +127,20 @@ pub fn main(init: std.process.Init) !void {
     const vocab_type_str = if (root_obj.get("vocab_type")) |v| try asString(v) else "raw";
     const vocab_type = try parseVocabType(vocab_type_str);
 
-    const vocab_size: ?i32 = if (root_obj.get("vocab_size")) |v| switch (v) {
+    const vocab_size: ?usize = if (root_obj.get("vocab_size")) |v| switch (v) {
         .null => null,
-        else => std.math.cast(i32, try asI64(v)) orelse return error.InvalidOracleInput,
+        else => std.math.cast(usize, try asI64(v)) orelse return error.InvalidOracleInput,
     } else null;
 
-    var stop_ids_buf: std.ArrayList(i32) = .empty;
+    var stop_ids_buf: std.ArrayList(u32) = .empty;
     defer stop_ids_buf.deinit(gpa);
-    const stop_token_ids: ?[]const i32 = if (root_obj.get("stop_token_ids")) |v| switch (v) {
+    const stop_token_ids: ?[]const u32 = if (root_obj.get("stop_token_ids")) |v| switch (v) {
         .null => null,
         else => blk: {
             const arr = try asArray(v);
             try stop_ids_buf.ensureTotalCapacity(gpa, arr.len);
             for (arr) |elem| {
-                stop_ids_buf.appendAssumeCapacity(std.math.cast(i32, try asI64(elem)) orelse return error.InvalidOracleInput);
+                stop_ids_buf.appendAssumeCapacity(std.math.cast(u32, try asI64(elem)) orelse return error.InvalidOracleInput);
             }
             break :blk stop_ids_buf.items;
         },
@@ -151,18 +151,15 @@ pub fn main(init: std.process.Init) !void {
         else => try asBool(v),
     } else false;
 
-    var tok = try xgrammar.TokenizerInfo.new(
-        gpa,
-        vocab,
-        vocab_type,
-        vocab_size,
-        stop_token_ids,
-        add_prefix_space,
-        null,
-    );
+    var tok = try xgrammar.TokenizerInfo.init(gpa, vocab, .{
+        .vocab_type = vocab_type,
+        .vocab_size = vocab_size,
+        .stop_token_ids = stop_token_ids,
+        .add_prefix_space = add_prefix_space,
+    });
     defer tok.deinit();
 
-    const compiler = try xgrammar.GrammarCompiler.with_defaults(gpa, &tok);
+    var compiler = try xgrammar.GrammarCompiler.init(gpa, &tok, .{});
     defer compiler.deinit();
 
     const grammar_obj = try asObject(root_obj.get("grammar") orelse return error.InvalidOracleInput);
@@ -172,24 +169,21 @@ pub fn main(init: std.process.Init) !void {
     var compiled = if (std.mem.eql(u8, grammar_type, "json_schema")) blk: {
         const any_whitespace = if (grammar_obj.get("any_whitespace")) |v| try asBool(v) else true;
         const strict_mode = if (grammar_obj.get("strict_mode")) |v| try asBool(v) else false;
-        break :blk try compiler.compile_json_schema(
-            grammar_text,
-            any_whitespace,
-            null,
-            null,
-            strict_mode,
-            null,
-            null,
-        );
+        break :blk try compiler.compileJsonSchema(grammar_text, .{
+            .any_whitespace = any_whitespace,
+            .strict_mode = strict_mode,
+        });
     } else if (std.mem.eql(u8, grammar_type, "ebnf")) blk: {
         const root_rule = if (grammar_obj.get("root")) |v| try asString(v) else "root";
-        break :blk try compiler.compile_grammar_ebnf(grammar_text, root_rule, null);
+        break :blk try compiler.compileEbnf(grammar_text, .{ .root_rule_name = root_rule });
     } else return error.UnknownGrammarType;
     defer compiled.deinit();
 
     const seqs_arr = try asArray(root_obj.get("sequences") orelse return error.InvalidOracleInput);
-    const bm_size: usize = @intCast(xgrammar.get_bitmask_size(tok.vocab_size));
-    const shape = [2]i64{ 1, @intCast(bm_size) };
+    const bm_size = xgrammar.bitmaskSize(tok.vocabSize());
+
+    var bitmask = try xgrammar.TokenBitmask.initSingle(gpa, tok.vocabSize());
+    defer bitmask.deinit();
 
     var out_aw: std.Io.Writer.Allocating = .init(gpa);
     defer out_aw.deinit();
@@ -197,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
 
     try jw.beginObject();
     try jw.objectField("vocab_size");
-    try jw.write(tok.vocab_size);
+    try jw.write(tok.vocabSize());
     try jw.objectField("bitmask_size");
     try jw.write(bm_size);
     try jw.objectField("sequences");
@@ -205,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (seqs_arr) |seq_val| {
         const seq_items = try asArray(seq_val);
-        var matcher = try xgrammar.GrammarMatcher.from_compiled_grammar(gpa, &compiled, false);
+        var matcher = try xgrammar.GrammarMatcher.init(gpa, &compiled, .{});
         defer matcher.deinit();
 
         try jw.beginObject();
@@ -221,14 +215,16 @@ pub fn main(init: std.process.Init) !void {
         try jw.beginArray();
         for (seq_items) |id_val| {
             const tok_id = std.math.cast(i32, try asI64(id_val)) orelse return error.InvalidOracleInput;
-            const bitmask = try xgrammar.allocate_token_bitmask(gpa, 1, tok.vocab_size);
-            defer gpa.free(bitmask);
+            bitmask.reset();
 
-            const fill_ok = matcher.fill_next_token_bitmask(bitmask, &shape, 0, null) catch |err| switch (err) {
+            const fill_ok = matcher.fillNextTokenBitmask(&bitmask, 0, null) catch |err| switch (err) {
                 error.Terminated => false,
                 else => return err,
             };
-            const accepted = try matcher.accept_token(tok_id);
+            const accepted = if (std.math.cast(u32, tok_id)) |uid|
+                try matcher.acceptToken(uid, null)
+            else
+                false;
 
             try jw.beginObject();
             try jw.objectField("token_id");
@@ -239,20 +235,20 @@ pub fn main(init: std.process.Init) !void {
             try jw.write(accepted);
             try jw.objectField("bitmask");
             try jw.beginArray();
-            for (bitmask) |w| {
+            for (bitmask.words) |w| {
                 try jw.write(@as(u64, @as(u32, @bitCast(w))));
             }
             try jw.endArray();
             try jw.objectField("completed");
-            try jw.write(matcher.is_completed());
+            try jw.write(matcher.isCompleted());
             try jw.objectField("terminated");
-            try jw.write(matcher.is_terminated());
+            try jw.write(matcher.isTerminated());
             try jw.endObject();
         }
         try jw.endArray();
 
-        const jump_end = if (!matcher.is_terminated())
-            try matcher.find_jump_forward_string(gpa, null)
+        const jump_end = if (!matcher.isTerminated())
+            try matcher.findJumpForwardString(gpa, null)
         else
             try gpa.dupe(u8, "");
         defer gpa.free(jump_end);

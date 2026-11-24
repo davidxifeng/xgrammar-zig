@@ -4,7 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const fsm_mod = @import("../fsm/mod.zig");
+const fsm_mod = @import("../fsm.zig");
 const FsmWithStartEnd = fsm_mod.FsmWithStartEnd;
 
 /// A `(target, min, max)` codepoint transition.
@@ -19,7 +19,7 @@ pub const Utf8RangeCollapser = struct {
     gpa: Allocator,
     fsm: *const FsmWithStartEnd,
     productive: []bool,
-    suffix_cache: std.AutoHashMap(SuffixKey, std.ArrayList(CodepointRange)),
+    suffix_cache: std.AutoHashMapUnmanaged(SuffixKey, std.ArrayList(CodepointRange)) = .empty,
 
     const SuffixKey = struct { state: i32, remaining: i32 };
 
@@ -30,25 +30,30 @@ pub const Utf8RangeCollapser = struct {
 
     /// Analyzes `fsm`, whose edges must all be byte ranges.
     pub fn init(gpa: Allocator, fsm: *const FsmWithStartEnd) Allocator.Error!Utf8RangeCollapser {
-        const num_states: usize = @intCast(fsm.num_states());
-        var predecessors = try gpa.alloc(std.ArrayList(i32), num_states);
+        const num_states: usize = @intCast(fsm.numStates());
+        const predecessors = try gpa.alloc(std.ArrayList(i32), num_states);
         for (predecessors) |*list| list.* = .empty;
-        var state: i32 = 0;
-        while (state < fsm.num_states()) : (state += 1) {
-            for (fsm.get_fsm().state_edges(state)) |edge| {
-                try predecessors[@intCast(edge.target)].append(gpa, state);
-            }
-        }
         defer {
             for (predecessors) |*list| list.deinit(gpa);
             gpa.free(predecessors);
         }
+
+        var state: i32 = 0;
+        while (state < fsm.numStates()) : (state += 1) {
+            for (fsm.getFsm().stateEdges(state)) |edge| {
+                try predecessors[@intCast(edge.target)].append(gpa, state);
+            }
+        }
+
         const productive = try gpa.alloc(bool, num_states);
+        errdefer gpa.free(productive);
         @memset(productive, false);
+
         var worklist: std.ArrayList(i32) = .empty;
+        defer worklist.deinit(gpa);
         var scan: i32 = 0;
-        while (scan < fsm.num_states()) : (scan += 1) {
-            if (fsm.is_end_state(scan)) try worklist.append(gpa, scan);
+        while (scan < fsm.numStates()) : (scan += 1) {
+            if (fsm.isEndState(scan)) try worklist.append(gpa, scan);
         }
         for (worklist.items) |s| productive[@intCast(s)] = true;
         var index: usize = 0;
@@ -60,12 +65,11 @@ pub const Utf8RangeCollapser = struct {
                 }
             }
         }
-        worklist.deinit(gpa);
+
         return .{
             .gpa = gpa,
             .fsm = fsm,
             .productive = productive,
-            .suffix_cache = std.AutoHashMap(SuffixKey, std.ArrayList(CodepointRange)).init(gpa),
         };
     }
 
@@ -73,20 +77,20 @@ pub const Utf8RangeCollapser = struct {
         self.gpa.free(self.productive);
         var it = self.suffix_cache.valueIterator();
         while (it.next()) |list| list.deinit(self.gpa);
-        self.suffix_cache.deinit();
+        self.suffix_cache.deinit(self.gpa);
     }
 
     /// Whether an accepting state is reachable from `state`.
-    pub fn is_productive(self: *const Utf8RangeCollapser, state: i32) bool {
+    pub fn isProductive(self: *const Utf8RangeCollapser, state: i32) bool {
         return self.productive[@intCast(state)];
     }
 
     /// The merged `(target, min, max)` codepoint transitions out of `state`, sorted by
     /// target. The returned list is owned by the caller (allocated from `self.gpa`).
-    pub fn state_ranges(self: *Utf8RangeCollapser, state: i32) Allocator.Error!std.ArrayList(CodepointRange) {
+    pub fn stateRanges(self: *Utf8RangeCollapser, state: i32) Allocator.Error!std.ArrayList(CodepointRange) {
         var ranges: std.ArrayList(CodepointRange) = .empty;
-        errdefer ranges.deinit(self.gpa);
-        for (self.fsm.get_fsm().state_edges(state)) |edge| {
+        defer ranges.deinit(self.gpa);
+        for (self.fsm.getFsm().stateEdges(state)) |edge| {
             if (!self.productive[@intCast(edge.target)]) {
                 continue;
             }
@@ -103,10 +107,10 @@ pub const Utf8RangeCollapser = struct {
                 const mask: i32 = @intCast((@as(u32, 1) << @intCast(6 - remaining)) - 1);
                 var unicode_ranges: std.ArrayList(CodepointRange) = .empty;
                 defer unicode_ranges.deinit(self.gpa);
-                var suffix = try self.suffix_ranges(edge.target, @intCast(remaining));
+                var suffix = try self.suffixRanges(edge.target, @intCast(remaining));
                 defer suffix.deinit(self.gpa);
                 for (suffix.items) |r| {
-                    try append_range(
+                    try appendRange(
                         self.gpa,
                         &unicode_ranges,
                         min & mask,
@@ -127,20 +131,20 @@ pub const Utf8RangeCollapser = struct {
                 }
             }
         }
-        return merge(self.gpa, ranges);
+        return merge(self.gpa, ranges.items);
     }
 
     /// The codepoint suffixes of `remaining` continuation bytes starting at `state`.
-    fn suffix_ranges(self: *Utf8RangeCollapser, state: i32, remaining: i32) Allocator.Error!std.ArrayList(CodepointRange) {
+    fn suffixRanges(self: *Utf8RangeCollapser, state: i32, remaining: i32) Allocator.Error!std.ArrayList(CodepointRange) {
         if (self.suffix_cache.get(.{ .state = state, .remaining = remaining })) |cached| {
-            return clone_ranges(self.gpa, cached);
+            return cloneRanges(self.gpa, cached);
         }
         var ranges: std.ArrayList(CodepointRange) = .empty;
-        errdefer ranges.deinit(self.gpa);
+        defer ranges.deinit(self.gpa);
         if (remaining == 0) {
             try ranges.append(self.gpa, .{ state, 0, 0 });
         } else {
-            for (self.fsm.get_fsm().state_edges(state)) |edge| {
+            for (self.fsm.getFsm().stateEdges(state)) |edge| {
                 if (!self.productive[@intCast(edge.target)]) {
                     continue;
                 }
@@ -149,25 +153,23 @@ pub const Utf8RangeCollapser = struct {
                 if (min > max) {
                     continue;
                 }
-                var suffix = try self.suffix_ranges(edge.target, remaining - 1);
+                var suffix = try self.suffixRanges(edge.target, remaining - 1);
                 defer suffix.deinit(self.gpa);
                 for (suffix.items) |r| {
-                    try append_range(self.gpa, &ranges, min & 0x3f, max & 0x3f, 6 * (remaining - 1), r);
+                    try appendRange(self.gpa, &ranges, min & 0x3f, max & 0x3f, 6 * (remaining - 1), r);
                 }
             }
         }
-        var merged = try merge(self.gpa, ranges);
+        var merged = try merge(self.gpa, ranges.items);
         errdefer merged.deinit(self.gpa);
-        try self.suffix_cache.put(.{ .state = state, .remaining = remaining }, try clone_ranges(self.gpa, merged));
+        var cached_copy = try cloneRanges(self.gpa, merged);
+        errdefer cached_copy.deinit(self.gpa);
+        try self.suffix_cache.put(self.gpa, .{ .state = state, .remaining = remaining }, cached_copy);
         return merged;
     }
 
-    /// Sorts the ranges and merges adjacent or overlapping ranges of the same target.
-    /// Consumes `ranges` (ownership transfers to the result or back to the caller on the
-    /// error path).
-    fn merge(gpa: Allocator, ranges_in: std.ArrayList(CodepointRange)) Allocator.Error!std.ArrayList(CodepointRange) {
-        var ranges = ranges_in;
-        const items = ranges.items;
+    /// Sorts `items` in place and returns merged adjacent or overlapping ranges per target.
+    fn merge(gpa: Allocator, items: []CodepointRange) Allocator.Error!std.ArrayList(CodepointRange) {
         std.mem.sort(CodepointRange, items, {}, struct {
             fn lessThan(_: void, a: CodepointRange, b: CodepointRange) bool {
                 if (a[0] != b[0]) return a[0] < b[0];
@@ -187,13 +189,12 @@ pub const Utf8RangeCollapser = struct {
             }
             try merged.append(gpa, r);
         }
-        ranges.deinit(gpa);
         return merged;
     }
 
     /// Prefixes the suffix range with every leading value in `[min, max]`, shifted by
     /// `shift`.
-    fn append_range(
+    fn appendRange(
         gpa: Allocator,
         ranges: *std.ArrayList(CodepointRange),
         min: i32,
@@ -215,8 +216,44 @@ pub const Utf8RangeCollapser = struct {
     }
 };
 
-fn clone_ranges(gpa: Allocator, ranges: std.ArrayList(CodepointRange)) Allocator.Error!std.ArrayList(CodepointRange) {
+fn cloneRanges(gpa: Allocator, ranges: std.ArrayList(CodepointRange)) Allocator.Error!std.ArrayList(CodepointRange) {
     var out: std.ArrayList(CodepointRange) = .empty;
     try out.appendSlice(gpa, ranges.items);
     return out;
+}
+
+test "Utf8RangeCollapser collapses ASCII and multi-byte UTF-8 transitions with zero leaks" {
+    const a = std.testing.allocator;
+    const Fsm = fsm_mod.Fsm;
+    // Build a small UTF-8 NFA accepting:
+    // - 'a'..'c' (0->1)
+    // - U+00E9 ('é', 0xC3 0xA9): 0->2->1
+    // - dead branch 0->3 (non-productive)
+    var fsm = try Fsm.init(a, 4);
+    errdefer fsm.deinit();
+    try fsm.addEdge(0, 1, 'a', 'c');
+    try fsm.addEdge(0, 2, 0xC3, 0xC3);
+    try fsm.addEdge(2, 1, 0xA9, 0xA9);
+    try fsm.addEdge(0, 3, 'z', 'z');
+
+    var ends: std.ArrayList(i32) = .empty;
+    errdefer ends.deinit(a);
+    try ends.append(a, 1);
+
+    var wse = FsmWithStartEnd.init(a, fsm, 0, ends, false);
+    defer wse.deinit();
+
+    var collapser = try Utf8RangeCollapser.init(a, &wse);
+    defer collapser.deinit();
+
+    try std.testing.expect(collapser.isProductive(0));
+    try std.testing.expect(collapser.isProductive(1));
+    try std.testing.expect(collapser.isProductive(2));
+    try std.testing.expect(!collapser.isProductive(3));
+
+    var ranges = try collapser.stateRanges(0);
+    defer ranges.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), ranges.items.len);
+    try std.testing.expectEqual(CodepointRange{ 1, 'a', 'c' }, ranges.items[0]);
+    try std.testing.expectEqual(CodepointRange{ 1, 0xE9, 0xE9 }, ranges.items[1]);
 }

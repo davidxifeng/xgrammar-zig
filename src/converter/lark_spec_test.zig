@@ -1,50 +1,46 @@
 //! Port of `tests/cpp/test_lark_converter.rs`.
-//!
-//! Tests that need the compiler wave (`GrammarCompiler`, `compile_lark`) are gated with
-//! `error.SkipZigTest` until that wave lands (parser-wave precedent).
 
 const std = @import("std");
-const grammar_mod = @import("../grammar/mod.zig");
-const printer = @import("../grammar/printer.zig");
-const lark_converter = @import("lark_converter.zig");
-const lark_error = @import("lark_error.zig");
-const named_grammar_mod = @import("named_grammar.zig");
-const regex_converter = @import("regex_converter.zig");
-const tokenizer_mod = @import("../tokenizer/mod.zig");
+
+const Diagnostic = @import("../Diagnostic.zig").Diagnostic;
+const grammar_mod = @import("../grammar.zig");
+const tokenizer_mod = @import("../tokenizer.zig");
+const lark_ast = @import("lark/ast.zig");
+const lark_compiler = @import("lark/compiler.zig");
+const regex_mod = @import("regex.zig");
+
 const Grammar = grammar_mod.Grammar;
-const LarkErrorInfo = lark_error.LarkErrorInfo;
-const NamedGrammar = named_grammar_mod.NamedGrammar;
-const TokenizerInfo = tokenizer_mod.tokenizer_info.TokenizerInfo;
-const VocabType = tokenizer_mod.vocab_type.VocabType;
+const NamedGrammar = lark_ast.NamedGrammar;
+const TokenizerInfo = tokenizer_mod.TokenizerInfo;
 
 const allocator = std.testing.allocator;
 
 fn lark(source: []const u8) ![]u8 {
-    var info: ?LarkErrorInfo = null;
-    const grammar = lark_converter.from_lark(allocator, source, null, &.{}, &info) catch |err| {
-        if (info) |*i| {
-            defer i.deinit(allocator);
-            const msg = try i.format_message(allocator);
+    var diag: Diagnostic = .{};
+    defer diag.deinit(allocator);
+    var grammar = lark_compiler.fromLark(allocator, source, null, &.{}, &diag) catch |err| {
+        if (diag.kind != .none) {
+            const msg = try diag.formatAlloc(allocator);
             defer allocator.free(msg);
             std.debug.print("lark() unexpected error: {s}\n", .{msg});
         }
         return err;
     };
     defer grammar.deinit();
-    return printer.to_string_ebnf(grammar, allocator);
+    return grammar.toStringEbnf(allocator);
 }
 
-fn lark_source(name: []const u8, source: []const u8) NamedGrammar {
+fn larkSource(name: []const u8, source: []const u8) NamedGrammar {
     return .{ .lark = .{ .name = name, .source = source } };
 }
 
-fn lark_grammar(name: []const u8, grammar: *const Grammar) NamedGrammar {
+fn larkGrammar(name: []const u8, grammar: *const Grammar) NamedGrammar {
     return .{ .grammar = .{ .name = name, .grammar = grammar } };
 }
 
-/// Same as `expect_error`, driven by an already-materialized error info.
-fn expect_error_matches(info: *const LarkErrorInfo, pattern: []const u8) !void {
-    const message = try info.format_message(allocator);
+/// Same as `larkErrorMatches`, driven by an already-populated `Diagnostic`.
+fn expectErrorMatches(diag: *const Diagnostic, pattern: []const u8) !void {
+    const message = try diag.formatAlloc(allocator);
     defer allocator.free(message);
     var rest: []const u8 = message;
     var it = std.mem.splitSequence(u8, pattern, ".*");
@@ -57,16 +53,17 @@ fn expect_error_matches(info: *const LarkErrorInfo, pattern: []const u8) !void {
     }
 }
 
-/// Runs `from_lark`, expecting failure; asserts the message against `pattern`.
-fn lark_error_matches(source: []const u8, pattern: []const u8) !void {
-    var info: ?LarkErrorInfo = null;
-    if (lark_converter.from_lark(allocator, source, null, &.{}, &info)) |grammar| {
+/// Runs `fromLark`, expecting failure; asserts the formatted `Diagnostic` against `pattern`.
+fn larkErrorMatches(source: []const u8, pattern: []const u8) !void {
+    var diag: Diagnostic = .{};
+    defer diag.deinit(allocator);
+    if (lark_compiler.fromLark(allocator, source, null, &.{}, &diag)) |g| {
+        var grammar = g;
         grammar.deinit();
         std.debug.print("expected error for: {s}\n", .{source});
         return error.TestUnexpectedResult;
     } else |_| {}
-    defer if (info) |*i| i.deinit(allocator);
-    try expect_error_matches(&info.?, pattern);
+    try expectErrorMatches(&diag, pattern);
 }
 
 test "default arguments" {
@@ -117,13 +114,13 @@ test "inline and nested grammar" {
 }
 
 test "named grammars" {
-    const word = try regex_converter.from_regex(allocator, "[a-z]+", null);
+    var word = try regex_mod.fromRegex(allocator, "[a-z]+", null);
     defer word.deinit();
-    const number = try lark_converter.from_lark(allocator, "start: /[0-9]+/", null, &.{}, null);
+    var number = try lark_compiler.fromLark(allocator, "start: /[0-9]+/", null, &.{}, null);
     defer number.deinit();
-    var named = [_]NamedGrammar{
-        lark_grammar("word", word),
-        lark_grammar("number", number),
+    const named = [_]NamedGrammar{
+        larkGrammar("word", &word),
+        larkGrammar("number", &number),
     };
     const source =
         \\
@@ -132,94 +129,114 @@ test "named grammars" {
         \\        }
         \\
     ;
-    const grammar = try lark_converter.from_lark(allocator, source, null, &named, null);
+    var grammar = try lark_compiler.fromLark(allocator, source, null, &named, null);
     defer grammar.deinit();
-    const printed = try printer.to_string_ebnf(grammar, allocator);
+    const printed = try grammar.toStringEbnf(allocator);
     defer allocator.free(printed);
     try std.testing.expect(std.mem.indexOf(u8, printed, "[a-z]") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "[0-9]") != null);
 }
 
 test "named grammar sources" {
-    var named = [_]NamedGrammar{
-        lark_source("pair", "start: @item \":\" @item"),
-        lark_source("item", "start: /[a-z]+/"),
+    const named = [_]NamedGrammar{
+        larkSource("pair", "start: @item \":\" @item"),
+        larkSource("item", "start: /[a-z]+/"),
     };
-    const grammar = try lark_converter.from_lark(allocator, "start: @pair", null, &named, null);
+    var grammar = try lark_compiler.fromLark(allocator, "start: @pair", null, &named, null);
     defer grammar.deinit();
-    const printed = try printer.to_string_ebnf(grammar, allocator);
+    const printed = try grammar.toStringEbnf(allocator);
     defer allocator.free(printed);
     try std.testing.expect(std.mem.indexOf(u8, printed, "[a-z]") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "\":\"") != null);
 }
 
 test "named grammar cycle" {
-    var named = [_]NamedGrammar{
-        lark_source("left", "start: @right"),
-        lark_source("right", "start: @left"),
+    const named = [_]NamedGrammar{
+        larkSource("left", "start: @right"),
+        larkSource("right", "start: @left"),
     };
-    var info: ?LarkErrorInfo = null;
-    if (lark_converter.from_lark(allocator, "start: @left", null, &named, &info)) |grammar| {
+    var diag: Diagnostic = .{};
+    defer diag.deinit(allocator);
+    if (lark_compiler.fromLark(allocator, "start: @left", null, &named, &diag)) |g| {
+        var grammar = g;
         grammar.deinit();
         return error.TestUnexpectedResult;
     } else |_| {}
-    defer if (info) |*i| i.deinit(allocator);
-    try expect_error_matches(&info.?, "circular named grammar reference: @left -> @right -> @left");
+    try expectErrorMatches(&diag, "circular named grammar reference: @left -> @right -> @left");
 }
 
 test "grammar compiler caches lark sources" {
-    const compiler_mod = @import("../compiler/mod.zig");
+    const compiler_mod = @import("../compiler.zig");
     const GrammarCompiler = compiler_mod.GrammarCompiler;
 
     const vocab = [_][]const u8{ "a", "b", "c", "item" };
-    var tokenizer_info = try TokenizerInfo.new(allocator, &vocab, .Raw, 4, &.{}, false, null);
+    var tokenizer_info = try TokenizerInfo.init(allocator, &vocab, .{
+        .vocab_type = .raw,
+        .vocab_size = 4,
+    });
     defer tokenizer_info.deinit();
 
-    const compiler_inst = try GrammarCompiler.new(allocator, &tokenizer_info, 1, true, -1);
+    var compiler_inst = try GrammarCompiler.init(allocator, &tokenizer_info, .{
+        .max_threads = 1,
+        .cache_enabled = true,
+    });
     defer compiler_inst.deinit();
 
-    var first = try compiler_inst.compile_lark("start: \"a\"", &.{}, null);
+    var first = try compiler_inst.compileLark("start: \"a\"", .{});
     defer first.deinit();
-    var repeated = try compiler_inst.compile_lark("start: \"a\"", &.{}, null);
+    var repeated = try compiler_inst.compileLark("start: \"a\"", .{});
     defer repeated.deinit();
-    try std.testing.expect(first.shares_storage(&repeated));
+    try std.testing.expect(first.sharesStorage(&repeated));
 
-    var named_grammars = [_]NamedGrammar{
-        lark_source("left", "start: \"a\""),
-        lark_source("right", "start: \"b\""),
+    const named_grammars = [_]NamedGrammar{
+        larkSource("left", "start: \"a\""),
+        larkSource("right", "start: \"b\""),
     };
-    var with_named_grammars = try compiler_inst.compile_lark("start: @left @right", &named_grammars, null);
+    var with_named_grammars = try compiler_inst.compileLark("start: @left @right", .{
+        .named_grammars = &named_grammars,
+    });
     defer with_named_grammars.deinit();
-    var reversed = [_]NamedGrammar{ named_grammars[1], named_grammars[0] };
-    var with_reordered_named_grammars = try compiler_inst.compile_lark("start: @left @right", &reversed, null);
+    const reversed = [_]NamedGrammar{ named_grammars[1], named_grammars[0] };
+    var with_reordered_named_grammars = try compiler_inst.compileLark("start: @left @right", .{
+        .named_grammars = &reversed,
+    });
     defer with_reordered_named_grammars.deinit();
-    try std.testing.expect(with_named_grammars.shares_storage(&with_reordered_named_grammars));
+    try std.testing.expect(with_named_grammars.sharesStorage(&with_reordered_named_grammars));
 
     const diff_named = [_]NamedGrammar{
-        lark_source("left", "start: \"a\""),
-        lark_source("right", "start: \"c\""),
+        larkSource("left", "start: \"a\""),
+        larkSource("right", "start: \"c\""),
     };
-    var with_different_named_grammar = try compiler_inst.compile_lark("start: @left @right", &diff_named, null);
+    var with_different_named_grammar = try compiler_inst.compileLark("start: @left @right", .{
+        .named_grammars = &diff_named,
+    });
     defer with_different_named_grammar.deinit();
-    try std.testing.expect(!with_named_grammars.shares_storage(&with_different_named_grammar));
+    try std.testing.expect(!with_named_grammars.sharesStorage(&with_different_named_grammar));
 
-    const item1 = try lark_converter.from_lark(allocator, "start: \"item\"", null, &.{}, null);
+    var item1 = try lark_compiler.fromLark(allocator, "start: \"item\"", null, &.{}, null);
     defer item1.deinit();
-    const item2 = try lark_converter.from_lark(allocator, "start: \"item\"", null, &.{}, null);
+    var item2 = try lark_compiler.fromLark(allocator, "start: \"item\"", null, &.{}, null);
     defer item2.deinit();
-    var with_grammar_object = try compiler_inst.compile_lark("start: @item", &.{lark_grammar("item", item1)}, null);
+    var with_grammar_object = try compiler_inst.compileLark("start: @item", .{
+        .named_grammars = &.{larkGrammar("item", &item1)},
+    });
     defer with_grammar_object.deinit();
-    var with_equivalent_grammar_object = try compiler_inst.compile_lark("start: @item", &.{lark_grammar("item", item2)}, null);
+    var with_equivalent_grammar_object = try compiler_inst.compileLark("start: @item", .{
+        .named_grammars = &.{larkGrammar("item", &item2)},
+    });
     defer with_equivalent_grammar_object.deinit();
-    try std.testing.expect(with_grammar_object.shares_storage(&with_equivalent_grammar_object));
+    try std.testing.expect(with_grammar_object.sharesStorage(&with_equivalent_grammar_object));
 
-    const uncached_compiler = try GrammarCompiler.new(allocator, &tokenizer_info, 1, false, -1);
+    var uncached_compiler = try GrammarCompiler.init(allocator, &tokenizer_info, .{
+        .max_threads = 1,
+        .cache_enabled = false,
+    });
     defer uncached_compiler.deinit();
-    var uncached_first = try uncached_compiler.compile_lark("start: \"a\"", &.{}, null);
+    var uncached_first = try uncached_compiler.compileLark("start: \"a\"", .{});
     defer uncached_first.deinit();
-    var uncached_second = try uncached_compiler.compile_lark("start: \"a\"", &.{}, null);
+    var uncached_second = try uncached_compiler.compileLark("start: \"a\"", .{});
     defer uncached_second.deinit();
-    try std.testing.expect(!uncached_first.shares_storage(&uncached_second));
+    try std.testing.expect(!uncached_first.sharesStorage(&uncached_second));
 }
 
 test "dynamic tool call lowers to tag dispatch" {
@@ -246,11 +263,14 @@ test "dynamic tool call lowers to tag dispatch" {
 
 test "numeric and named special tokens" {
     const vocab = [_][]const u8{ "a", "<|tool|>", "b" };
-    var tokenizer_info = try tokenizer_mod.tokenizer_info.TokenizerInfo.new(allocator, &vocab, .Raw, 3, &.{}, false, null);
+    var tokenizer_info = try TokenizerInfo.init(allocator, &vocab, .{
+        .vocab_type = .raw,
+        .vocab_size = 3,
+    });
     defer tokenizer_info.deinit();
-    const grammar = try lark_converter.from_lark(allocator, "start: <[0,2]> | <|tool|>", &tokenizer_info, &.{}, null);
+    var grammar = try lark_compiler.fromLark(allocator, "start: <[0,2]> | <|tool|>", &tokenizer_info, &.{}, null);
     defer grammar.deinit();
-    const printed = try printer.to_string_ebnf(grammar, allocator);
+    const printed = try grammar.toStringEbnf(allocator);
     defer allocator.free(printed);
     try std.testing.expect(std.mem.indexOf(u8, printed, "Token(0, 2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "Token(1)") != null);
@@ -269,7 +289,7 @@ test "string and regex flags" {
 }
 
 test "case-insensitive string rejects non-ASCII" {
-    try lark_error_matches("start: \"Żółw\"i", "case-insensitive string literals currently support ASCII characters only");
+    try larkErrorMatches("start: \"Żółw\"i", "case-insensitive string literals currently support ASCII characters only");
 }
 
 test "dynamic regex suffix and suffix attribute" {
@@ -295,29 +315,30 @@ test "dynamic regex suffix and suffix attribute" {
 }
 
 test "errors contain source locations" {
-    try lark_error_matches("item: \"a\"", "line 1, column 1.*no start rule");
-    try lark_error_matches("start: missing", "line 1, column 8.*unknown name");
-    try lark_error_matches("start: FOO\nFOO: BAR\nBAR: FOO", "circular reference in terminal");
-    try lark_error_matches("start[budget=10]: \"a\"", "attribute 'budget' is not supported");
-    try lark_error_matches("start[capture=\"a b\"]: \"a\"", "capture name must only contain letters, digits");
-    try lark_error_matches("start: A & B\nA: \"a\"\nB: \"b\"", "intersection '&' is not supported");
-    try lark_error_matches("start: /abc/m", "regular-expression flag 'm' is not supported");
-    try lark_error_matches("start: TOKEN\nTOKEN: %json {}", "%json cannot be used in terminals");
-    try lark_error_matches("start: TOKEN\nTOKEN: %lark { start: \"a\" }", "nested %lark cannot be used in terminals");
-    try lark_error_matches("start: <[1-2-3]>", "invalid numeric special-token range");
-    try lark_error_matches("start: @missing", "line 1, column 8.*unknown named grammar '@missing'");
+    try larkErrorMatches("item: \"a\"", "line 1, column 1.*no start rule");
+    try larkErrorMatches("start: missing", "line 1, column 8.*unknown name");
+    try larkErrorMatches("start: FOO\nFOO: BAR\nBAR: FOO", "circular reference in terminal");
+    try larkErrorMatches("start[budget=10]: \"a\"", "attribute 'budget' is not supported");
+    try larkErrorMatches("start[capture=\"a b\"]: \"a\"", "capture name must only contain letters, digits");
+    try larkErrorMatches("start: A & B\nA: \"a\"\nB: \"b\"", "intersection '&' is not supported");
+    try larkErrorMatches("start: /abc/m", "regular-expression flag 'm' is not supported");
+    try larkErrorMatches("start: TOKEN\nTOKEN: %json {}", "%json cannot be used in terminals");
+    try larkErrorMatches("start: TOKEN\nTOKEN: %lark { start: \"a\" }", "nested %lark cannot be used in terminals");
+    try larkErrorMatches("start: <[1-2-3]>", "invalid numeric special-token range");
+    try larkErrorMatches("start: @missing", "line 1, column 8.*unknown named grammar '@missing'");
 }
 
 test "duplicate named grammar" {
-    var named = [_]NamedGrammar{
-        lark_source("item", "start: \"a\""),
-        lark_source("item", "start: \"b\""),
+    const named = [_]NamedGrammar{
+        larkSource("item", "start: \"a\""),
+        larkSource("item", "start: \"b\""),
     };
-    var info: ?LarkErrorInfo = null;
-    if (lark_converter.from_lark(allocator, "start: @item", null, &named, &info)) |grammar| {
+    var diag: Diagnostic = .{};
+    defer diag.deinit(allocator);
+    if (lark_compiler.fromLark(allocator, "start: @item", null, &named, &diag)) |g| {
+        var grammar = g;
         grammar.deinit();
         return error.TestUnexpectedResult;
     } else |_| {}
-    defer if (info) |*i| i.deinit(allocator);
-    try expect_error_matches(&info.?, "Duplicate named grammar 'item'");
+    try expectErrorMatches(&diag, "Duplicate named grammar 'item'");
 }

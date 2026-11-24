@@ -1,6 +1,4 @@
-//! Runtime-sized bitset over a `u32` word array.
-//!
-//! This is the owned form; the matcher's external-buffer (DLTensor) view lands in M6.
+//! Unmanaged runtime-sized bitset over a `u32` word array.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -8,74 +6,68 @@ const Allocator = std.mem.Allocator;
 /// Bits packed per backing word.
 pub const BITS_PER_BLOCK: usize = 32;
 
-/// A bitset whose length is fixed at construction time.
+/// An unmanaged bitset whose length is fixed at construction time.
 ///
-/// Bits `0..len` are addressable; the final word may contain unused high padding bits
-/// (e.g. after `set_all`). Scans that could return a padding index are bounded by `len`.
+/// Bits `0..size` are addressable; the final word may contain unused high padding bits
+/// (e.g. after `setAll`). Queries respect `size` and never return padding indices.
 pub const DynamicBitset = struct {
-    allocator: Allocator,
-    size: usize,
-    data: []u32,
+    size: usize = 0,
+    data: []u32 = &.{},
 
-    /// Error set for the JSON round-trip helpers (Rust returns message strings).
     pub const JsonError = error{ InvalidJson, OutOfMemory };
+    pub const empty: DynamicBitset = .{};
 
     /// Minimal `u32` buffer length needed to hold `element_size` bits.
-    pub fn buffer_size(element_size: usize) usize {
+    pub fn bufferSize(element_size: usize) usize {
         return std.math.divCeil(usize, element_size, BITS_PER_BLOCK) catch unreachable;
     }
 
     /// Creates a bitset of `size` bits, all cleared.
     pub fn init(allocator: Allocator, size: usize) Allocator.Error!DynamicBitset {
-        const data = try allocator.alloc(u32, buffer_size(size));
+        const words = bufferSize(size);
+        if (words == 0) return .{ .size = 0, .data = &.{} };
+        const data = try allocator.alloc(u32, words);
         @memset(data, 0);
-        return .{ .allocator = allocator, .size = size, .data = data };
+        return .{ .size = size, .data = data };
     }
 
     /// Releases the backing buffer.
-    pub fn deinit(self: *DynamicBitset) void {
-        self.allocator.free(self.data);
-        self.* = undefined;
+    pub fn deinit(self: *DynamicBitset, allocator: Allocator) void {
+        if (self.data.len > 0) allocator.free(self.data);
+        self.* = .{};
     }
 
-    /// Deep copy in `allocator` (Rust `Clone`).
-    pub fn clone(self: *const DynamicBitset, allocator: Allocator) Allocator.Error!DynamicBitset {
-        const data = try allocator.dupe(u32, self.data);
-        return .{ .allocator = allocator, .size = self.size, .data = data };
+    /// Deep copy in `allocator`.
+    pub fn dupe(self: *const DynamicBitset, allocator: Allocator) Allocator.Error!DynamicBitset {
+        if (self.data.len == 0) return .{ .size = self.size, .data = &.{} };
+        return .{ .size = self.size, .data = try allocator.dupe(u32, self.data) };
     }
 
-    /// Number of addressable bits.
     pub fn len(self: *const DynamicBitset) usize {
         return self.size;
     }
 
-    /// Whether the bitset holds zero bits.
-    pub fn is_empty(self: *const DynamicBitset) bool {
+    pub fn isEmpty(self: *const DynamicBitset) bool {
         return self.size == 0;
     }
 
-    /// The raw backing words.
-    pub fn as_words(self: *const DynamicBitset) []const u32 {
+    pub fn asWords(self: *const DynamicBitset) []const u32 {
         return self.data;
     }
 
-    /// Returns the bit at `index`. Panics if `index >= len`.
     pub fn get(self: *const DynamicBitset, index: usize) bool {
         std.debug.assert(index < self.size);
         return (self.data[index / BITS_PER_BLOCK] >> @intCast(index % BITS_PER_BLOCK)) & 1 == 1;
     }
 
-    /// Sets every bit (including padding bits in the final word) to `true`.
-    pub fn set_all(self: *DynamicBitset) void {
+    pub fn setAll(self: *DynamicBitset) void {
         @memset(self.data, std.math.maxInt(u32));
     }
 
-    /// Clears every bit.
-    pub fn reset_all(self: *DynamicBitset) void {
+    pub fn resetAll(self: *DynamicBitset) void {
         @memset(self.data, 0);
     }
 
-    /// Sets the bit at `index` to `value`. Panics if `index >= len`.
     pub fn set(self: *DynamicBitset, index: usize, value: bool) void {
         std.debug.assert(index < self.size);
         const word = &self.data[index / BITS_PER_BLOCK];
@@ -87,29 +79,25 @@ pub const DynamicBitset = struct {
         }
     }
 
-    /// Clears the bit at `index`. Panics if `index >= len`.
     pub fn reset(self: *DynamicBitset, index: usize) void {
         self.set(index, false);
     }
 
-    /// Bitwise-ORs `other` into `self`.
-    ///
-    /// Panics if `self`'s buffer is larger than `other`'s (mirrors the C++ contract that
-    /// `self` must be no larger than `other`).
-    pub fn or_assign(self: *DynamicBitset, other: *const DynamicBitset) void {
+    pub fn orAssign(self: *DynamicBitset, other: *const DynamicBitset) void {
         std.debug.assert(self.data.len <= other.data.len);
-        for (self.data, other.data) |*dst, src| {
+        for (self.data, other.data[0..self.data.len]) |*dst, src| {
             dst.* |= src;
         }
     }
 
-    /// Index of the first set bit, or `null`.
-    pub fn find_first_one(self: *const DynamicBitset) ?usize {
-        return self.do_find_one_from(0);
+    /// Index of the first set bit in `0..size`, or `null`.
+    pub fn findFirstOne(self: *const DynamicBitset) ?usize {
+        if (self.size == 0) return null;
+        return self.doFindOneFrom(0);
     }
 
-    /// Index of the first set bit strictly after `pos`, or `null`.
-    pub fn find_next_one(self: *const DynamicBitset, pos: usize) ?usize {
+    /// Index of the first set bit strictly after `pos` in `0..size`, or `null`.
+    pub fn findNextOne(self: *const DynamicBitset, pos: usize) ?usize {
         if (self.size == 0 or pos >= self.size - 1) return null;
         const pos1 = pos + 1;
         const blk = pos1 / BITS_PER_BLOCK;
@@ -118,20 +106,18 @@ pub const DynamicBitset = struct {
         const result = if (fore != 0)
             pos1 + @as(usize, @ctz(fore))
         else
-            self.do_find_one_from(blk + 1);
-        if (result) |r| {
-            if (r < self.size) return r;
-        }
-        return null;
+            self.doFindOneFrom(blk + 1);
+        return if (result) |r| (if (r < self.size) r else null) else null;
     }
 
-    /// Index of the first cleared bit, or `null`.
-    pub fn find_first_zero(self: *const DynamicBitset) ?usize {
-        return self.do_find_zero_from(0);
+    /// Index of the first cleared bit in `0..size`, or `null`.
+    pub fn findFirstZero(self: *const DynamicBitset) ?usize {
+        if (self.size == 0) return null;
+        return self.doFindZeroFrom(0);
     }
 
-    /// Index of the first cleared bit strictly after `pos`, or `null`.
-    pub fn find_next_zero(self: *const DynamicBitset, pos: usize) ?usize {
+    /// Index of the first cleared bit strictly after `pos` in `0..size`, or `null`.
+    pub fn findNextZero(self: *const DynamicBitset, pos: usize) ?usize {
         if (self.size == 0 or pos >= self.size - 1) return null;
         const pos1 = pos + 1;
         const blk = pos1 / BITS_PER_BLOCK;
@@ -140,48 +126,42 @@ pub const DynamicBitset = struct {
         const result = if (fore != 0)
             pos1 + @as(usize, @ctz(fore))
         else
-            self.do_find_zero_from(blk + 1);
-        if (result) |r| {
-            if (r < self.size) return r;
-        }
-        return null;
+            self.doFindZeroFrom(blk + 1);
+        return if (result) |r| (if (r < self.size) r else null) else null;
     }
 
-    /// Number of set bits across the whole backing buffer (including any padding bits).
     pub fn count(self: *const DynamicBitset) usize {
         var total: usize = 0;
         for (self.data) |w| total += @popCount(w);
         return total;
     }
 
-    /// Whether every addressable bit is set.
     pub fn all(self: *const DynamicBitset) bool {
         if (self.size == 0) return true;
         const last = self.data.len - 1;
         for (self.data[0..last]) |w| {
             if (w != std.math.maxInt(u32)) return false;
         }
-        return (self.data[last] & self.last_block_mask()) == self.last_block_mask();
+        return (self.data[last] & self.lastBlockMask()) == self.lastBlockMask();
     }
 
-    /// Whether any addressable bit is set (padding bits in the final word are ignored).
     pub fn any(self: *const DynamicBitset) bool {
         if (self.size == 0) return false;
         const last = self.data.len - 1;
         for (self.data[0..last]) |w| {
             if (w != 0) return true;
         }
-        return (self.data[last] & self.last_block_mask()) != 0;
+        return (self.data[last] & self.lastBlockMask()) != 0;
     }
 
-    /// The mask of the addressable bits in the final word.
-    fn last_block_mask(self: *const DynamicBitset) u32 {
+    fn lastBlockMask(self: *const DynamicBitset) u32 {
         if (self.size % BITS_PER_BLOCK == 0) return std.math.maxInt(u32);
         const remaining: u5 = @intCast(self.size % BITS_PER_BLOCK);
         return (@as(u32, 1) << remaining) - 1;
     }
 
-    fn do_find_one_from(self: *const DynamicBitset, first_block: usize) ?usize {
+    fn doFindOneFrom(self: *const DynamicBitset, first_block: usize) ?usize {
+        if (first_block >= self.data.len) return null;
         var pos: ?usize = null;
         for (self.data[first_block..], first_block..) |w, i| {
             if (w != 0) {
@@ -190,10 +170,12 @@ pub const DynamicBitset = struct {
             }
         }
         const p = pos orelse return null;
-        return p * BITS_PER_BLOCK + @as(usize, @ctz(self.data[p]));
+        const bit = p * BITS_PER_BLOCK + @as(usize, @ctz(self.data[p]));
+        return if (bit < self.size) bit else null;
     }
 
-    fn do_find_zero_from(self: *const DynamicBitset, first_block: usize) ?usize {
+    fn doFindZeroFrom(self: *const DynamicBitset, first_block: usize) ?usize {
+        if (first_block >= self.data.len) return null;
         var pos: ?usize = null;
         for (self.data[first_block..], first_block..) |w, i| {
             if (w != std.math.maxInt(u32)) {
@@ -202,27 +184,26 @@ pub const DynamicBitset = struct {
             }
         }
         const p = pos orelse return null;
-        return p * BITS_PER_BLOCK + @as(usize, @ctz(~self.data[p]));
+        const bit = p * BITS_PER_BLOCK + @as(usize, @ctz(~self.data[p]));
+        return if (bit < self.size) bit else null;
     }
 
-    /// Serializes in the C++ JSON format: `[size, buffer_size, ...u32 words]`.
-    pub fn serialize_json_value_cpp(self: *const DynamicBitset, allocator: Allocator) Allocator.Error!std.json.Value {
-        var arr = std.json.Array.init(allocator);
-        errdefer arr.deinit();
-        try arr.append(.{ .integer = @intCast(self.size) });
-        try arr.append(.{ .integer = @intCast(buffer_size(self.size)) });
+    /// Streams in C++ JSON format: `[size, buffer_size, ...u32 words]`.
+    pub fn writeJsonCpp(self: *const DynamicBitset, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginArray();
+        try jw.write(self.size);
+        try jw.write(bufferSize(self.size));
         for (self.data) |word| {
-            try arr.append(.{ .integer = @intCast(word) });
+            try jw.write(word);
         }
-        return .{ .array = arr };
+        try jw.endArray();
     }
 
-    /// Deserializes the C++ JSON array format. On a shape error returns
-    /// `error.InvalidJson` (the Rust version returns a message string).
-    pub fn deserialize_json_value_cpp(allocator: Allocator, value: std.json.Value) JsonError!DynamicBitset {
+    /// Deserializes the C++ JSON array format.
+    pub fn deserializeJsonValueCpp(allocator: Allocator, value: std.json.Value) JsonError!DynamicBitset {
         const arr = switch (value) {
             .array => |a| a,
-            else => return error.InvalidJson, // "dynamic bitset expects a JSON array"
+            else => return error.InvalidJson,
         };
         if (arr.items.len < 2) return error.InvalidJson;
         const size_i64 = switch (arr.items[0]) {
@@ -237,9 +218,10 @@ pub const DynamicBitset = struct {
         };
         if (buffer_size_i64 < 0) return error.InvalidJson;
         const buffer_size_v: usize = @intCast(buffer_size_i64);
-        const expected = buffer_size(size);
+        const expected = bufferSize(size);
         if (buffer_size_v != expected) return error.InvalidJson;
         if (arr.items.len != 2 + buffer_size_v) return error.InvalidJson;
+        if (buffer_size_v == 0) return .{ .size = 0, .data = &.{} };
         const data = try allocator.alloc(u32, buffer_size_v);
         errdefer allocator.free(data);
         for (arr.items[2..], 0..) |item, i| {
@@ -250,16 +232,17 @@ pub const DynamicBitset = struct {
             if (word < 0 or word > std.math.maxInt(u32)) return error.InvalidJson;
             data[i] = @intCast(word);
         }
-        return .{ .allocator = allocator, .size = size, .data = data };
+        return .{ .size = size, .data = data };
     }
 };
 
 test "dynamic bitset basic set/get/reset" {
-    var bs = try DynamicBitset.init(std.testing.allocator, 70);
-    defer bs.deinit();
-    try std.testing.expectEqual(@as(usize, 3), bs.as_words().len);
+    const alloc = std.testing.allocator;
+    var bs = try DynamicBitset.init(alloc, 70);
+    defer bs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), bs.asWords().len);
     try std.testing.expectEqual(@as(usize, 70), bs.len());
-    try std.testing.expect(!bs.is_empty());
+    try std.testing.expect(!bs.isEmpty());
 
     try std.testing.expect(!bs.get(0));
     bs.set(0, true);
@@ -269,100 +252,96 @@ test "dynamic bitset basic set/get/reset" {
     try std.testing.expect(bs.get(32));
     try std.testing.expect(bs.get(69));
     try std.testing.expect(!bs.get(1));
-    try std.testing.expectEqual(@as(usize, 3), bs.count()); // includes padding? padding is 0 here
+    try std.testing.expectEqual(@as(usize, 3), bs.count());
 
     bs.reset(32);
     try std.testing.expect(!bs.get(32));
     try std.testing.expectEqual(@as(usize, 2), bs.count());
 
-    bs.set_all();
-    try std.testing.expectEqual(@as(usize, 96), bs.count()); // 3 words fully set
+    bs.setAll();
+    try std.testing.expectEqual(@as(usize, 96), bs.count());
     try std.testing.expect(bs.all());
-    bs.reset_all();
+    // Clear all valid bits in 0..70 while leaving padding bits set: findFirstOne must return null.
+    for (0..70) |i| bs.reset(i);
+    try std.testing.expect(bs.findFirstOne() == null);
+    bs.resetAll();
     try std.testing.expectEqual(@as(usize, 0), bs.count());
     try std.testing.expect(!bs.any());
 }
 
 test "dynamic bitset find one/zero with padding" {
-    var bs = try DynamicBitset.init(std.testing.allocator, 33);
-    defer bs.deinit();
-    try std.testing.expect(bs.find_first_one() == null);
-    try std.testing.expect(bs.find_first_zero().? == 0);
+    const alloc = std.testing.allocator;
+    var bs = try DynamicBitset.init(alloc, 33);
+    defer bs.deinit(alloc);
+    try std.testing.expect(bs.findFirstOne() == null);
+    try std.testing.expect(bs.findFirstZero().? == 0);
 
     bs.set(5, true);
-    try std.testing.expectEqual(@as(usize, 5), bs.find_first_one().?);
-    try std.testing.expectEqual(@as(usize, 0), bs.find_first_zero().?);
-    try std.testing.expectEqual(@as(usize, 5), bs.find_next_one(0).?);
-    try std.testing.expectEqual(@as(usize, 1), bs.find_next_zero(0).?);
+    try std.testing.expectEqual(@as(usize, 5), bs.findFirstOne().?);
+    try std.testing.expectEqual(@as(usize, 0), bs.findFirstZero().?);
+    try std.testing.expectEqual(@as(usize, 5), bs.findNextOne(0).?);
+    try std.testing.expectEqual(@as(usize, 1), bs.findNextZero(0).?);
 
     bs.set(32, true);
-    try std.testing.expectEqual(@as(usize, 5), bs.find_first_one().?);
-    try std.testing.expectEqual(@as(usize, 32), bs.find_next_one(6).?);
-    try std.testing.expectEqual(@as(usize, 32), bs.find_next_one(5).?);
-    try std.testing.expect(bs.find_next_one(32) == null);
-    // any/all with padding: word 1 has only bit 0 set (bit 32); padding bits clear.
+    try std.testing.expectEqual(@as(usize, 5), bs.findFirstOne().?);
+    try std.testing.expectEqual(@as(usize, 32), bs.findNextOne(6).?);
+    try std.testing.expectEqual(@as(usize, 32), bs.findNextOne(5).?);
+    try std.testing.expect(bs.findNextOne(32) == null);
     try std.testing.expect(bs.any());
     try std.testing.expect(!bs.all());
-    try std.testing.expectEqual(@as(usize, 2), bs.count()); // padding bits still count in count()
+    try std.testing.expectEqual(@as(usize, 2), bs.count());
 }
 
-test "dynamic bitset or_assign and clone" {
-    var a = try DynamicBitset.init(std.testing.allocator, 40);
-    defer a.deinit();
-    var b = try DynamicBitset.init(std.testing.allocator, 40);
-    defer b.deinit();
+test "dynamic bitset orAssign and dupe" {
+    const alloc = std.testing.allocator;
+    var a = try DynamicBitset.init(alloc, 40);
+    defer a.deinit(alloc);
+    var b = try DynamicBitset.init(alloc, 40);
+    defer b.deinit(alloc);
     a.set(3, true);
     b.set(39, true);
-    a.or_assign(&b);
+    a.orAssign(&b);
     try std.testing.expect(a.get(3));
     try std.testing.expect(a.get(39));
     try std.testing.expectEqual(@as(usize, 2), a.count());
 
-    var c = try a.clone(std.testing.allocator);
-    defer c.deinit();
+    var c = try a.dupe(alloc);
+    defer c.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), c.count());
-    try std.testing.expectEqualSlices(u32, a.as_words(), c.as_words());
+    try std.testing.expectEqualSlices(u32, a.asWords(), c.asWords());
 }
 
 test "dynamic bitset empty" {
-    var bs = try DynamicBitset.init(std.testing.allocator, 0);
-    defer bs.deinit();
-    try std.testing.expect(bs.is_empty());
+    const alloc = std.testing.allocator;
+    var bs = try DynamicBitset.init(alloc, 0);
+    defer bs.deinit(alloc);
+    try std.testing.expect(bs.isEmpty());
     try std.testing.expect(bs.len() == 0);
     try std.testing.expect(bs.all());
     try std.testing.expect(!bs.any());
-    try std.testing.expect(bs.find_first_one() == null);
-    try std.testing.expect(bs.find_first_zero() == null);
-    try std.testing.expect(bs.find_next_one(0) == null);
-    try std.testing.expect(bs.find_next_zero(0) == null);
+    try std.testing.expect(bs.findFirstOne() == null);
+    try std.testing.expect(bs.findFirstZero() == null);
+    try std.testing.expect(bs.findNextOne(0) == null);
+    try std.testing.expect(bs.findNextZero(0) == null);
 }
 
 test "dynamic bitset json round-trip" {
     const alloc = std.testing.allocator;
     var bs = try DynamicBitset.init(alloc, 65);
-    defer bs.deinit();
+    defer bs.deinit(alloc);
     bs.set(1, true);
     bs.set(64, true);
 
-    const value = try bs.serialize_json_value_cpp(alloc);
-    // Value owns its array; free it manually after use.
-    var restored = try DynamicBitset.deserialize_json_value_cpp(alloc, value);
-    defer restored.deinit();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var jw: std.json.Stringify = .{ .writer = &aw.writer };
+    try bs.writeJsonCpp(&jw);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const val = try @import("json_parse.zig").parseJson(arena.allocator(), aw.written());
+    var restored = try DynamicBitset.deserializeJsonValueCpp(alloc, val);
+    defer restored.deinit(alloc);
     try std.testing.expectEqual(bs.size, restored.size);
-    try std.testing.expectEqualSlices(u32, bs.as_words(), restored.as_words());
-    value.array.deinit();
-
-    // Shape errors.
-    var bad = std.json.Array.init(alloc);
-    defer bad.deinit();
-    try bad.append(.{ .integer = 65 });
-    try std.testing.expectError(error.InvalidJson, DynamicBitset.deserialize_json_value_cpp(alloc, .{ .array = bad }));
-
-    var bad2 = std.json.Array.init(alloc);
-    defer bad2.deinit();
-    try bad2.append(.{ .integer = 65 });
-    try bad2.append(.{ .integer = 1 }); // buffer_size mismatch (expected 3)
-    try std.testing.expectError(error.InvalidJson, DynamicBitset.deserialize_json_value_cpp(alloc, .{ .array = bad2 }));
-
-    try std.testing.expectError(error.InvalidJson, DynamicBitset.deserialize_json_value_cpp(alloc, .{ .integer = 1 }));
+    try std.testing.expectEqualSlices(u32, bs.asWords(), restored.asWords());
 }

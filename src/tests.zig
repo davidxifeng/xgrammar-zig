@@ -5,49 +5,48 @@ const xgrammar = @import("xgrammar.zig");
 
 const testing = std.testing;
 
-test "root_api_compiles_and_drives_a_matcher" {
+test "root API compiles and drives a matcher" {
     const a = testing.allocator;
-    const grammar = try xgrammar.converter.from_regex(a, "a+", null);
+    var grammar = try xgrammar.Grammar.fromRegex(a, "a+", null);
     defer grammar.deinit();
-    var tokenizer = try xgrammar.TokenizerInfo.new(a, &.{ "a", "b", "</s>" }, .Raw, null, null, false, null);
+    var tokenizer = try xgrammar.TokenizerInfo.init(a, &.{ "a", "b", "</s>" }, .{});
     defer tokenizer.deinit();
-    const compiler = try xgrammar.GrammarCompiler.with_defaults(a, &tokenizer);
+    var compiler = try xgrammar.GrammarCompiler.init(a, &tokenizer, .{});
     defer compiler.deinit();
-    var compiled = try compiler.compile_grammar(grammar, null);
+    var compiled = try compiler.compileGrammar(&grammar, null);
     defer compiled.deinit();
-    var matcher = try xgrammar.GrammarMatcher.from_compiled_grammar(a, &compiled, false);
+    var matcher = try xgrammar.GrammarMatcher.init(a, &compiled, .{});
     defer matcher.deinit();
-    const bitmask = try xgrammar.allocate_token_bitmask(a, 1, tokenizer.vocab_size);
-    defer a.free(bitmask);
+    var bitmask = try xgrammar.TokenBitmask.initSingle(a, tokenizer.vocabSize());
+    defer bitmask.deinit();
 
-    const shape = [2]i64{ 1, xgrammar.get_bitmask_size(tokenizer.vocab_size) };
-    _ = try matcher.fill_next_token_bitmask(bitmask, &shape, 0, null);
-    const masked = try xgrammar.get_masked_tokens_from_bitmask(a, bitmask, tokenizer.vocab_size, 0);
+    _ = try matcher.fillNextTokenBitmask(&bitmask, 0, null);
+    const masked = try bitmask.maskedTokens(a, 0);
     defer a.free(masked);
-    try testing.expectEqualSlices(i32, &.{ 1, 2 }, masked);
-    try testing.expect(try matcher.accept_token(0));
-    try testing.expect(matcher.is_completed());
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, masked);
+    try testing.expect(try matcher.acceptToken(0, null));
+    try testing.expect(matcher.isCompleted());
 }
 
-test "distinct_serialized_rule_graphs_preserve_mask_walks" {
+test "distinct serialized rule graphs preserve mask walks" {
     const a = testing.allocator;
-    var tokenizer = try xgrammar.TokenizerInfo.new(a, &.{ "a", "b", "</s>" }, .Raw, null, &.{2}, false, null);
+    var tokenizer = try xgrammar.TokenizerInfo.init(a, &.{ "a", "b", "</s>" }, .{ .stop_token_ids = &.{2} });
     defer tokenizer.deinit();
-    const comp = try xgrammar.GrammarCompiler.with_defaults(a, &tokenizer);
+    var comp = try xgrammar.GrammarCompiler.init(a, &tokenizer, .{});
     defer comp.deinit();
-    const regex_g = try xgrammar.converter.from_regex(a, "a+", null);
+    var regex_g = try xgrammar.Grammar.fromRegex(a, "a+", null);
     defer regex_g.deinit();
-    var compiled = try comp.compile_grammar(regex_g, null);
+    var compiled = try comp.compileGrammar(&regex_g, null);
     defer compiled.deinit();
 
-    const original_json = try compiled.serialize_json(a);
+    const original_json = try compiled.serializeJson(a);
     defer a.free(original_json);
 
     for ([_]bool{ false, true }) |pad_aux| {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        const value = try xgrammar.support.parse_json(sa, original_json);
+        const value = try xgrammar.internal.support.parseJson(sa, original_json);
         const per_rule = value.object.get("grammar").?.object.get("per_rule_fsms").?.array.items[0].array.items[0].array.items[0].object;
         if (pad_aux) {
             try per_rule.getPtr("edge_aux_data").?.array.append(.{ .integer = 0 });
@@ -55,52 +54,46 @@ test "distinct_serialized_rule_graphs_preserve_mask_walks" {
             const offsets = &per_rule.getPtr("edges").?.object.getPtr("indptr_").?.array;
             try offsets.append(offsets.items[offsets.items.len - 1]);
         }
-        var restored = try xgrammar.CompiledGrammar.deserialize_json_value(a, value, &tokenizer, null);
+        var restored = try xgrammar.CompiledGrammar.deserializeJsonValue(a, value, &tokenizer, null);
         defer restored.deinit();
 
-        var expected = try xgrammar.GrammarMatcher.from_compiled_grammar(a, &compiled, false);
+        var expected = try xgrammar.GrammarMatcher.init(a, &compiled, .{});
         defer expected.deinit();
-        var actual = try xgrammar.GrammarMatcher.from_compiled_grammar(a, &restored, false);
+        var actual = try xgrammar.GrammarMatcher.init(a, &restored, .{});
         defer actual.deinit();
 
-        const shape = [2]i64{ 1, xgrammar.get_bitmask_size(tokenizer.vocab_size) };
-        for ([_]i32{ 0, 0, 2 }) |token| {
-            const expected_mask = try xgrammar.allocate_token_bitmask(a, 1, tokenizer.vocab_size);
-            defer a.free(expected_mask);
-            const actual_mask = try a.dupe(i32, expected_mask);
-            defer a.free(actual_mask);
+        for ([_]u32{ 0, 0, 2 }) |token| {
+            var expected_mask = try xgrammar.TokenBitmask.initSingle(a, tokenizer.vocabSize());
+            defer expected_mask.deinit();
+            var actual_mask = try xgrammar.TokenBitmask.initSingle(a, tokenizer.vocabSize());
+            defer actual_mask.deinit();
             try testing.expectEqual(
-                try expected.fill_next_token_bitmask(expected_mask, &shape, 0, null),
-                try actual.fill_next_token_bitmask(actual_mask, &shape, 0, null),
+                try expected.fillNextTokenBitmask(&expected_mask, 0, null),
+                try actual.fillNextTokenBitmask(&actual_mask, 0, null),
             );
-            try testing.expectEqualSlices(i32, expected_mask, actual_mask);
-            try testing.expectEqual(try expected.accept_token(token), try actual.accept_token(token));
-            try testing.expectEqual(expected.is_completed(), actual.is_completed());
+            try testing.expectEqualSlices(i32, expected_mask.words, actual_mask.words);
+            try testing.expectEqual(try expected.acceptToken(token, null), try actual.acceptToken(token, null));
+            try testing.expectEqual(expected.isCompleted(), actual.isCompleted());
         }
     }
 }
 
-test "shared_rule_storage_keeps_accepting_states_per_rule" {
+test "shared rule storage keeps accepting states per rule" {
     const a = testing.allocator;
-    var tokenizer = try xgrammar.TokenizerInfo.new(a, &.{ "a", "b", "</s>" }, .Raw, null, &.{2}, false, null);
+    var tokenizer = try xgrammar.TokenizerInfo.init(a, &.{ "a", "b", "</s>" }, .{ .stop_token_ids = &.{2} });
     defer tokenizer.deinit();
-    const comp = try xgrammar.GrammarCompiler.with_defaults(a, &tokenizer);
+    var comp = try xgrammar.GrammarCompiler.init(a, &tokenizer, .{});
     defer comp.deinit();
-    const ebnf_g = try xgrammar.functor.grammar_normalizer_mod.from_ebnf(
-        a,
-        "root ::= \"a\" second\nsecond ::= \"b\"",
-        "root",
-        null,
-    );
+    var ebnf_g = try xgrammar.Grammar.fromEbnf(a, "root ::= \"a\" second\nsecond ::= \"b\"", .{});
     defer ebnf_g.deinit();
-    var compiled = try comp.compile_grammar(ebnf_g, null);
+    var compiled = try comp.compileGrammar(&ebnf_g, null);
     defer compiled.deinit();
 
-    const json_str = try compiled.serialize_json(a);
+    const json_str = try compiled.serializeJson(a);
     defer a.free(json_str);
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    const value = try xgrammar.support.parse_json(scratch.allocator(), json_str);
+    const value = try xgrammar.internal.support.parseJson(scratch.allocator(), json_str);
 
     const per_rule = value.object.get("grammar").?.object.get("per_rule_fsms").?.array;
     const root_start = per_rule.items[0].array.items[0].array.items[1];
@@ -109,52 +102,52 @@ test "shared_rule_storage_keeps_accepting_states_per_rule" {
     try ends_arr.append(root_start);
     per_rule.items[1].array.items[0].array.items[2] = .{ .array = ends_arr };
 
-    var restored = try xgrammar.CompiledGrammar.deserialize_json_value(a, value, &tokenizer, null);
+    var restored = try xgrammar.CompiledGrammar.deserializeJsonValue(a, value, &tokenizer, null);
     defer restored.deinit();
-    var matcher = try xgrammar.GrammarMatcher.from_compiled_grammar(a, &restored, false);
+    var matcher = try xgrammar.GrammarMatcher.init(a, &restored, .{});
     defer matcher.deinit();
-    try testing.expect(try matcher.accept_token(0));
-    try testing.expect(matcher.is_completed());
-    try testing.expect(try matcher.accept_token(2));
-    try testing.expect(matcher.is_terminated());
+    try testing.expect(try matcher.acceptToken(0, null));
+    try testing.expect(matcher.isCompleted());
+    try testing.expect(try matcher.acceptToken(2, null));
+    try testing.expect(matcher.isTerminated());
 }
 
-test "earley parser clone produces independent divergent parses" {
+test "EarleyParser dupe produces independent divergent parses" {
     const a = testing.allocator;
-    const g = try xgrammar.functor.grammar_normalizer_mod.from_ebnf(a, "root ::= \"ab\" | \"ac\"", "root", null);
+    var g = try xgrammar.Grammar.fromEbnf(a, "root ::= \"ab\" | \"ac\"", .{});
     defer g.deinit();
-    const opt = try xgrammar.functor.grammar_optimizer(a, g, null);
+    var opt = try xgrammar.internal.functor.optimizeGrammar(a, &g, null);
     defer opt.deinit();
 
-    const p1 = try xgrammar.parser.EarleyParser.new(a, opt, null);
+    var p1 = try xgrammar.internal.parser.EarleyParser.init(a, &opt, null);
     defer p1.deinit();
     try testing.expect(try p1.advance('a'));
 
-    const p2 = try p1.clone(a);
+    var p2 = try p1.dupe(a);
     defer p2.deinit();
 
     try testing.expect(try p1.advance('b'));
-    try testing.expect(p1.is_root_completed());
-    try testing.expect(!p2.is_root_completed());
+    try testing.expect(p1.isRootCompleted());
+    try testing.expect(!p2.isRootCompleted());
 
     try testing.expect(!(try p2.advance('b' + 2))); // 'd'
     try testing.expect(try p2.advance('c'));
-    try testing.expect(p2.is_root_completed());
+    try testing.expect(p2.isRootCompleted());
 }
 
-test "testing print_grammar_fsms and is_rule_fsm_accept_string" {
+test "testing printGrammarFsms and isRuleFsmAcceptString" {
     const a = testing.allocator;
-    const g = try xgrammar.functor.grammar_normalizer_mod.from_ebnf(a, "root ::= [a-z] [a-z]*", "root", null);
+    var g = try xgrammar.Grammar.fromEbnf(a, "root ::= [a-z] [a-z]*", .{});
     defer g.deinit();
-    const opt = try xgrammar.functor.grammar_optimizer(a, g, null);
+    var opt = try xgrammar.internal.functor.optimizeGrammar(a, &g, null);
     defer opt.deinit();
 
-    const dumped = try xgrammar.testing.print_grammar_fsms(a, opt);
+    const dumped = try xgrammar.testing.printGrammarFsms(a, &opt);
     defer a.free(dumped);
     try testing.expect(std.mem.indexOf(u8, dumped, "Rule 0: root, FSM: CompactFSM(") != null);
-    try testing.expect(try xgrammar.testing.is_rule_fsm_accept_string(opt, 0, "abc"));
-    try testing.expect(!(try xgrammar.testing.is_rule_fsm_accept_string(opt, 0, "")));
-    try testing.expect(!(try xgrammar.testing.is_rule_fsm_accept_string(opt, 0, "123")));
+    try testing.expect(try xgrammar.testing.isRuleFsmAcceptString(a, &opt, 0, "abc"));
+    try testing.expect(!(try xgrammar.testing.isRuleFsmAcceptString(a, &opt, 0, "")));
+    try testing.expect(!(try xgrammar.testing.isRuleFsmAcceptString(a, &opt, 0, "123")));
 }
 
 test {

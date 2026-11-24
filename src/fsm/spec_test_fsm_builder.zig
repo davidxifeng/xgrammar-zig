@@ -1,23 +1,21 @@
 //! Port of `external/xgrammar/tests/cpp/test_fsm_builder.cc` (spec tests).
 //!
-//! Covers the trie builder and the regex builder (`RegexFsmBuilder`). The per-expression
-//! `GrammarFsmBuilder` tests (tag-dispatch, token-tag-dispatch, byte-string, rule-ref,
-//! character-class, sequence, choices) and the `build_with_forbidden_chars` tests that need
-//! `GrammarFsmBuilder::json_string_forbidden_chars` are translated but gated behind the
-//! functor wave (`error.SkipZigTest` until functor lands) — see the delivery report.
+//! Covers `TrieFsmBuilder`, `RegexFsmBuilder`, and `GrammarFsmBuilder`
+//! (tag-dispatch, token-tag-dispatch, byte-string, rule-ref, character-class,
+//! sequence, choices, and `buildWithForbiddenChars` / `jsonStringForbiddenChars`).
 
 const std = @import("std");
-const fsm_mod = @import("mod.zig");
-const functor_mod = @import("../functor/mod.zig");
-const grammar_mod = @import("../grammar/mod.zig");
+const Diagnostic = @import("../Diagnostic.zig").Diagnostic;
+const fsm_mod = @import("../fsm.zig");
+const functor_mod = @import("../functor.zig");
+const grammar_mod = @import("../grammar.zig");
+
 const GrammarFsmBuilder = functor_mod.GrammarFsmBuilder;
+const GrammarBuilder = grammar_mod.GrammarBuilder;
 const GrammarExpr = grammar_mod.GrammarExpr;
 const TagDispatch = grammar_mod.TagDispatch;
-const TagRulePair = grammar_mod.tag_dispatch.TagRulePair;
 const TokenTagDispatch = grammar_mod.TokenTagDispatch;
-const TriggerRulePair = grammar_mod.token_tag_dispatch.TriggerRulePair;
 const CompactFsm = fsm_mod.CompactFsm;
-const EdgeKind = fsm_mod.EdgeKind;
 const FsmWithStartEnd = fsm_mod.FsmWithStartEnd;
 const NO_NEXT_STATE = fsm_mod.NO_NEXT_STATE;
 const RegexFsmBuilder = fsm_mod.RegexFsmBuilder;
@@ -33,12 +31,15 @@ fn build(a: A, regex: []const u8) !FsmWithStartEnd {
     return RegexFsmBuilder.build(a, regex, null, "", null);
 }
 
-fn build_err(a: A, regex: []const u8) ![]u8 {
-    var msg: ?[]u8 = null;
-    if (RegexFsmBuilder.build(a, regex, null, "", &msg)) |_| {
+fn buildErr(a: A, regex: []const u8) ![]u8 {
+    var diag: Diagnostic = .{};
+    defer diag.deinit(a);
+    if (RegexFsmBuilder.build(a, regex, null, "", &diag)) |built| {
+        var mut = built;
+        mut.deinit();
         return error.TestUnexpectedResult;
     } else |_| {
-        return msg.?;
+        return diag.formatAlloc(a);
     }
 }
 
@@ -52,33 +53,33 @@ test "test_trie_fsm_builder" {
     defer fsm.deinit();
 
     // A compact round-trip is constructible from the built trie.
-    var compact = try CompactFsm.from_fsm(a, fsm.get_fsm());
+    var compact = try CompactFsm.fromFsm(a, fsm.getFsm());
     defer compact.deinit();
 
-    try std.testing.expectEqual(@as(i32, 0), fsm.get_start());
+    try std.testing.expectEqual(@as(i32, 0), fsm.startState());
 
     const next = struct {
         fn f(fsm_wse: *const FsmWithStartEnd, state: i32, c: u8) i32 {
-            return fsm_wse.get_fsm().next_state(state, c, .CharRange);
+            return fsm_wse.getFsm().nextState(state, c, .CharRange);
         }
     }.f;
 
     // "hello".
-    try std.testing.expectEqual(@as(i32, 1), next(&fsm, fsm.get_start(), 'h'));
+    try std.testing.expectEqual(@as(i32, 1), next(&fsm, fsm.startState(), 'h'));
     try std.testing.expectEqual(@as(i32, 2), next(&fsm, 1, 'e'));
     try std.testing.expectEqual(@as(i32, 3), next(&fsm, 2, 'l'));
     try std.testing.expectEqual(@as(i32, 4), next(&fsm, 3, 'l'));
     try std.testing.expectEqual(@as(i32, 5), next(&fsm, 4, 'o'));
-    try std.testing.expect(fsm.is_end_state(5));
+    try std.testing.expect(fsm.isEndState(5));
 
     // "hil" (prefix of "hili", not itself a pattern).
-    try std.testing.expectEqual(@as(i32, 1), next(&fsm, fsm.get_start(), 'h'));
+    try std.testing.expectEqual(@as(i32, 1), next(&fsm, fsm.startState(), 'h'));
     try std.testing.expectEqual(@as(i32, 6), next(&fsm, 1, 'i'));
     try std.testing.expectEqual(@as(i32, 13), next(&fsm, 6, 'l'));
-    try std.testing.expect(!fsm.is_end_state(13));
+    try std.testing.expect(!fsm.isEndState(13));
 
     // Walk failure: "goe" has no transition after "go".
-    try std.testing.expectEqual(@as(i32, 15), next(&fsm, fsm.get_start(), 'g'));
+    try std.testing.expectEqual(@as(i32, 15), next(&fsm, fsm.startState(), 'g'));
     try std.testing.expectEqual(@as(i32, 16), next(&fsm, 15, 'o'));
     try std.testing.expectEqual(@as(i32, -1), next(&fsm, 16, 'e'));
 }
@@ -99,9 +100,7 @@ test "test_trie_excluded_suffixes" {
         const fsm_opt = try TrieFsmBuilder.build(a, &.{}, excludes, null, true, true);
         var fsm_wse = fsm_opt.?;
         defer fsm_wse.deinit();
-        const fsm = fsm_wse.get_fsm();
-        // Compare the byte FSM against an independent substring predicate for every string up to
-        // length five, rather than depending on generated state numbers.
+        const fsm = fsm_wse.getFsm();
         var inputs: std.ArrayList([]u8) = .empty;
         try inputs.append(a, try a.dupe(u8, ""));
         for (0..6) |length| {
@@ -115,9 +114,9 @@ test "test_trie_excluded_suffixes" {
                         }
                     }
                 }
-                var state = fsm_wse.get_start();
+                var state = fsm_wse.startState();
                 for (input) |byte| {
-                    state = fsm.next_state(state, byte, .CharRange);
+                    state = fsm.nextState(state, byte, .CharRange);
                     if (state == NO_NEXT_STATE) break;
                 }
                 try std.testing.expectEqual(expected, state != NO_NEXT_STATE);
@@ -143,40 +142,36 @@ test "test_regex_repeat_zero" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    // {0} / {0,0} matches exactly the empty string (ECMA-262 semantics, and consistent
-    // with the EBNF parser and the CFG fallback path).
+
     var m1 = try build(a, "a{0}");
     defer m1.deinit();
-    try std.testing.expect(try m1.accept_string(""));
-    try std.testing.expect(!try m1.accept_string("a"));
+    try std.testing.expect(try m1.acceptString(""));
+    try std.testing.expect(!try m1.acceptString("a"));
 
     var m2 = try build(a, "a{0,0}");
     defer m2.deinit();
-    try std.testing.expect(try m2.accept_string(""));
-    try std.testing.expect(!try m2.accept_string("a"));
+    try std.testing.expect(try m2.acceptString(""));
+    try std.testing.expect(!try m2.acceptString("a"));
 
     var m3 = try build(a, "(ab){0}");
     defer m3.deinit();
-    try std.testing.expect(try m3.accept_string(""));
-    try std.testing.expect(!try m3.accept_string("ab"));
+    try std.testing.expect(try m3.acceptString(""));
+    try std.testing.expect(!try m3.acceptString("ab"));
 
-    // In a concatenation the {0} element contributes nothing.
     var m4 = try build(a, "ba{0}c");
     defer m4.deinit();
-    try std.testing.expect(try m4.accept_string("bc"));
-    try std.testing.expect(!try m4.accept_string("bac"));
+    try std.testing.expect(try m4.acceptString("bc"));
+    try std.testing.expect(!try m4.acceptString("bac"));
 
-    // The empty-string FSM survives the simplification passes.
     var m5 = try build(a, "ba{0}c");
     defer m5.deinit();
-    var s5 = try m5.simplify_epsilon(a);
+    var s5 = try m5.simplifyEpsilon(a);
     defer s5.deinit();
-    var merged5 = try s5.merge_equivalent_states(a);
+    var merged5 = try s5.mergeEquivalentStates(a);
     defer merged5.deinit();
-    try std.testing.expect(try merged5.accept_string("bc"));
-    try std.testing.expect(!try merged5.accept_string("bac"));
+    try std.testing.expect(try merged5.acceptString("bc"));
+    try std.testing.expect(!try merged5.acceptString("bac"));
 
-    // A lower bound larger than the upper bound is an error in every regex dialect.
     try std.testing.expectError(error.RegexParse, build(a, "a{3,1}"));
     try std.testing.expectError(error.RegexParse, build(a, "a{1,0}"));
 }
@@ -188,40 +183,38 @@ test "test_regex_case_insensitive_flag" {
 
     var m1 = try build(a, "(?i)abc");
     defer m1.deinit();
-    try std.testing.expect(try m1.accept_string("abc"));
-    try std.testing.expect(try m1.accept_string("ABC"));
-    try std.testing.expect(try m1.accept_string("aBc"));
-    try std.testing.expect(!try m1.accept_string("abd"));
+    try std.testing.expect(try m1.acceptString("abc"));
+    try std.testing.expect(try m1.acceptString("ABC"));
+    try std.testing.expect(try m1.acceptString("aBc"));
+    try std.testing.expect(!try m1.acceptString("abd"));
 
     var m2 = try build(a, "(?i)(ab|cd)+");
     defer m2.deinit();
-    try std.testing.expect(try m2.accept_string("aBcD"));
-    try std.testing.expect(!try m2.accept_string("ac"));
+    try std.testing.expect(try m2.acceptString("aBcD"));
+    try std.testing.expect(!try m2.acceptString("ac"));
 
     var m3 = try build(a, "(?i)[a-dx]");
     defer m3.deinit();
-    try std.testing.expect(try m3.accept_string("b"));
-    try std.testing.expect(try m3.accept_string("B"));
-    try std.testing.expect(try m3.accept_string("X"));
-    try std.testing.expect(!try m3.accept_string("e"));
-    try std.testing.expect(!try m3.accept_string("E"));
+    try std.testing.expect(try m3.acceptString("b"));
+    try std.testing.expect(try m3.acceptString("B"));
+    try std.testing.expect(try m3.acceptString("X"));
+    try std.testing.expect(!try m3.acceptString("e"));
+    try std.testing.expect(!try m3.acceptString("E"));
 
     var m4 = try build(a, "(?i)[^k]");
     defer m4.deinit();
-    try std.testing.expect(try m4.accept_string("a"));
-    try std.testing.expect(!try m4.accept_string("k"));
-    try std.testing.expect(!try m4.accept_string("K"));
+    try std.testing.expect(try m4.acceptString("a"));
+    try std.testing.expect(!try m4.acceptString("k"));
+    try std.testing.expect(!try m4.acceptString("K"));
 
-    // Only ASCII letters are folded; non-ASCII characters match literally.
     var m5 = try build(a, "(?i)Σ");
     defer m5.deinit();
-    try std.testing.expect(try m5.accept_string("Σ"));
-    try std.testing.expect(!try m5.accept_string("σ"));
+    try std.testing.expect(try m5.acceptString("Σ"));
+    try std.testing.expect(!try m5.acceptString("σ"));
 
-    // Without the prefix the match stays case-sensitive.
     var m6 = try build(a, "abc");
     defer m6.deinit();
-    try std.testing.expect(!try m6.accept_string("ABC"));
+    try std.testing.expect(!try m6.acceptString("ABC"));
 }
 
 test "test_regex_escapes" {
@@ -229,48 +222,44 @@ test "test_regex_escapes" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // \xHH, \uHHHH and \u{...} escapes, both standalone and inside classes.
     var m1 = try build(a, "\\x41B\\u{43}");
     defer m1.deinit();
-    try std.testing.expect(try m1.accept_string("ABC"));
+    try std.testing.expect(try m1.acceptString("ABC"));
 
     var m2 = try build(a, "\\u{1F600}");
     defer m2.deinit();
-    try std.testing.expect(try m2.accept_string("😀"));
-    try std.testing.expect(!try m2.accept_string("😁"));
+    try std.testing.expect(try m2.acceptString("😀"));
+    try std.testing.expect(!try m2.acceptString("😁"));
 
     var m3 = try build(a, "[A-C]+");
     defer m3.deinit();
-    try std.testing.expect(try m3.accept_string("ABC"));
-    try std.testing.expect(!try m3.accept_string("D"));
+    try std.testing.expect(try m3.acceptString("ABC"));
+    try std.testing.expect(!try m3.acceptString("D"));
 
-    // A quantifier after a multi-byte character applies to the whole codepoint.
     var m4 = try build(a, "好*");
     defer m4.deinit();
-    try std.testing.expect(try m4.accept_string(""));
-    try std.testing.expect(try m4.accept_string("好好"));
-    try std.testing.expect(!try m4.accept_string("\xbd"));
+    try std.testing.expect(try m4.acceptString(""));
+    try std.testing.expect(try m4.acceptString("好好"));
+    try std.testing.expect(!try m4.acceptString("\xbd"));
 
-    // \s follows ECMAScript WhiteSpace + LineTerminator (ASCII whitespace + U+00A0, U+3000, U+FEFF, ...).
     var m5 = try build(a, "\\s+");
     defer m5.deinit();
-    try std.testing.expect(try m5.accept_string(" \t\n\r\x0c\x0b"));
-    try std.testing.expect(!try m5.accept_string("\x00"));
-    try std.testing.expect(!try m5.accept_string("\x01"));
+    try std.testing.expect(try m5.acceptString(" \t\n\r\x0c\x0b"));
+    try std.testing.expect(!try m5.acceptString("\x00"));
+    try std.testing.expect(!try m5.acceptString("\x01"));
 
-    // \S is the codepoint-domain complement, so non-ASCII characters are accepted.
     var m6 = try build(a, "\\S");
     defer m6.deinit();
-    try std.testing.expect(try m6.accept_string("好"));
-    try std.testing.expect(try m6.accept_string("\x00"));
-    try std.testing.expect(!try m6.accept_string(" "));
+    try std.testing.expect(try m6.acceptString("好"));
+    try std.testing.expect(try m6.acceptString("\x00"));
+    try std.testing.expect(!try m6.acceptString(" "));
 }
 
 test "test_regex_unsupported_features" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    // Word boundaries, Unicode properties and backreferences raise errors.
+
     try std.testing.expectError(error.RegexParse, build(a, "a\\b"));
     try std.testing.expectError(error.RegexParse, build(a, "a\\B"));
     try std.testing.expectError(error.RegexParse, build(a, "\\p{L}"));
@@ -280,97 +269,91 @@ test "test_regex_unsupported_features" {
     try std.testing.expectError(error.RegexParse, build(a, "[]"));
     try std.testing.expectError(error.RegexParse, build(a, "[^]"));
 
-    // Lookahead assertions are ignored with a warning (treated as the empty string).
     var m1 = try build(a, "a(?=b)c");
     defer m1.deinit();
-    try std.testing.expect(try m1.accept_string("ac"));
+    try std.testing.expect(try m1.acceptString("ac"));
     var m2 = try build(a, "a(?!b)c");
     defer m2.deinit();
-    try std.testing.expect(try m2.accept_string("ac"));
+    try std.testing.expect(try m2.acceptString("ac"));
 
-    // Named groups compile like plain groups; the name is ignored.
     var m3 = try build(a, "(?<name>ab)+");
     defer m3.deinit();
-    try std.testing.expect(try m3.accept_string("abab"));
+    try std.testing.expect(try m3.acceptString("abab"));
     var m4 = try build(a, "(?P<name>ab)c");
     defer m4.deinit();
-    try std.testing.expect(try m4.accept_string("abc"));
+    try std.testing.expect(try m4.acceptString("abc"));
 
-    // Mid-pattern anchors are ignored with a warning.
     var m5 = try build(a, "a^b$c");
     defer m5.deinit();
-    try std.testing.expect(try m5.accept_string("abc"));
+    try std.testing.expect(try m5.acceptString("abc"));
 
-    // Non-greedy quantifiers behave like their greedy counterparts.
     var m6 = try build(a, "a*?b+?c??(de){1,2}?");
     defer m6.deinit();
-    try std.testing.expect(try m6.accept_string("aabbcde"));
-    try std.testing.expect(try m6.accept_string("bdede"));
+    try std.testing.expect(try m6.acceptString("aabbcde"));
+    try std.testing.expect(try m6.acceptString("bdede"));
 
-    // Empty alternatives match the empty string.
     var m7 = try build(a, "(a|)b");
     defer m7.deinit();
-    try std.testing.expect(try m7.accept_string("ab"));
-    try std.testing.expect(try m7.accept_string("b"));
+    try std.testing.expect(try m7.acceptString("ab"));
+    try std.testing.expect(try m7.acceptString("b"));
     var m8 = try build(a, "a|");
     defer m8.deinit();
-    try std.testing.expect(try m8.accept_string("a"));
-    try std.testing.expect(try m8.accept_string(""));
+    try std.testing.expect(try m8.acceptString("a"));
+    try std.testing.expect(try m8.acceptString(""));
 }
 
 test "test_regex_error_messages" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    // Parse errors mirror the RegexConverter format and carry the 1-based position.
+
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 1: There is nothing to repeat before '+'",
-        try build_err(a, "+a"),
+        try buildErr(a, "+a"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 3: Unmatched ')'",
-        try build_err(a, "ab)"),
+        try buildErr(a, "ab)"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Unmatched ']'",
-        try build_err(a, "a]"),
+        try buildErr(a, "a]"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: The parenthesis is not closed",
-        try build_err(a, "a(bc"),
+        try buildErr(a, "a(bc"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Unclosed '['",
-        try build_err(a, "a[bc"),
+        try buildErr(a, "a[bc"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Empty character class is not allowed in regex",
-        try build_err(a, "a[]"),
+        try buildErr(a, "a[]"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Invalid repetition count: expected a number after '{'",
-        try build_err(a, "a{,2}"),
+        try buildErr(a, "a{,2}"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Invalid repetition count: the lower bound 3 is larger than the upper bound 1",
-        try build_err(a, "a{3,1}"),
+        try buildErr(a, "a{3,1}"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Invalid repetition count: the count 9999999999 is too large",
-        try build_err(a, "a{1,9999999999}"),
+        try buildErr(a, "a{1,9999999999}"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 2: Word boundary assertion \\b is not supported in regex",
-        try build_err(a, "a\\b"),
+        try buildErr(a, "a\\b"),
     );
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 1: Invalid named capturing group",
-        try build_err(a, "(?<name)a"),
+        try buildErr(a, "(?<name)a"),
     );
-    // The position includes the "(?i)" prefix when present.
     try std.testing.expectEqualStrings(
         "Regex parsing error at position 5: There is nothing to repeat before '+'",
-        try build_err(a, "(?i)+a"),
+        try buildErr(a, "(?i)+a"),
     );
 }
 
@@ -380,8 +363,9 @@ test "test_regex_matches_empty" {
     const a = ar.allocator();
     const matches_empty = struct {
         fn f(al: A, regex: []const u8) !bool {
-            var msg: ?[]u8 = null;
-            if (RegexFsmBuilder.matches_empty(al, regex, &msg)) |v| return v else |_| return error.TestUnexpectedResult;
+            var diag: Diagnostic = .{};
+            defer diag.deinit(al);
+            return RegexFsmBuilder.matchesEmpty(al, regex, &diag);
         }
     };
     try std.testing.expect(try matches_empty.f(a, "a*"));
@@ -391,43 +375,45 @@ test "test_regex_matches_empty" {
     try std.testing.expect(!try matches_empty.f(a, "a+"));
     try std.testing.expect(!try matches_empty.f(a, "a{1,10}"));
     try std.testing.expect(!try matches_empty.f(a, "ab|cd"));
-    // No FSM is built, so huge bounded repetitions are cheap to check.
     try std.testing.expect(!try matches_empty.f(a, "(abc){2,1000000}"));
     try std.testing.expect(try matches_empty.f(a, "(abc){0,1000000}"));
     try std.testing.expect(try matches_empty.f(a, "(?i)A*"));
-    var msg: ?[]u8 = null;
-    try std.testing.expectError(error.RegexParse, RegexFsmBuilder.matches_empty(a, "\\b", &msg));
+    var diag: Diagnostic = .{};
+    defer diag.deinit(a);
+    try std.testing.expectError(error.RegexParse, RegexFsmBuilder.matchesEmpty(a, "\\b", &diag));
 }
 
 test "test_regex_large_repeat_without_builder" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    // Without a GrammarBuilder, moderate repetitions are unrolled physically.
+
     var m1 = try build(a, "a{2,300}");
     defer m1.deinit();
-    try std.testing.expect(!try m1.accept_string("a"));
-    try std.testing.expect(try m1.accept_string("aa"));
+    try std.testing.expect(!try m1.acceptString("a"));
+    try std.testing.expect(try m1.acceptString("aa"));
     const a300 = try a.alloc(u8, 300);
     @memset(a300, 'a');
     const a301 = try a.alloc(u8, 301);
     @memset(a301, 'a');
-    try std.testing.expect(try m1.accept_string(a300));
-    try std.testing.expect(!try m1.accept_string(a301));
+    try std.testing.expect(try m1.acceptString(a300));
+    try std.testing.expect(!try m1.acceptString(a301));
 
-    // Repetitions whose estimated state count is too large report an error instead of hanging.
     try std.testing.expectError(error.RepeatTooLarge, build(a, "(abcdefghij){1,100000}"));
 }
 
 // ---------------------------------------------------------------------------
-// Tests below need `functor::GrammarFsmBuilder` (delivered and wired).
+// GrammarFsmBuilder tests
 // ---------------------------------------------------------------------------
 
-/// Builds a `TagDispatch` from string tags.
-fn tag_dispatch(a: A, pairs: []const [2][]const u8, loop_after: bool, excludes: []const []const u8) !TagDispatch {
-    var td = TagDispatch.empty();
+fn tagDispatch(a: A, pairs: []const [2][]const u8, loop_after: bool, excludes: []const []const u8) !TagDispatch {
+    var td: TagDispatch = .empty;
+    errdefer td.deinit(a);
     for (pairs) |pair| {
-        try td.tag_rule_pairs.append(a, .{ .tag = try a.dupe(u8, pair[0]), .rule_id = try std.fmt.parseInt(i32, pair[1], 10) });
+        try td.tag_rule_pairs.append(a, .{
+            .tag = try a.dupe(u8, pair[0]),
+            .rule_id = try std.fmt.parseInt(i32, pair[1], 10),
+        });
     }
     td.loop_after_dispatch = loop_after;
     for (excludes) |e| {
@@ -440,9 +426,10 @@ test "test_tag_dispatch_fsm_builder1" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    const td = try tag_dispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, true, &.{});
-    const fsm_opt = try GrammarFsmBuilder.tag_dispatch(a, &td);
-    const fsm = fsm_opt.?;
+    var td = try tagDispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, true, &.{});
+    defer td.deinit(a);
+    var fsm = (try GrammarFsmBuilder.tagDispatch(a, &td)).?;
+    defer fsm.deinit();
     const expected = "FSM(num_states=8, start=0, end=[0, 1, 2, 5, 6], edges=[" ++
         "\n0: [[\\0-g]->0, 'h'->1, [i-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
         "\n1: [[\\0-d]->0, 'e'->2, [f-g]->0, 'h'->1, 'i'->4, [j-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
@@ -453,7 +440,7 @@ test "test_tag_dispatch_fsm_builder1" {
         "\n6: [[\\0-g]->0, 'h'->1, [i-\\x87]->0, '\\x88'->7, [\\x89-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
         "\n7: [Rule(3)->0]" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -461,9 +448,10 @@ test "test_tag_dispatch_fsm_builder2" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    const td = try tag_dispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, false, &.{});
-    const fsm_opt = try GrammarFsmBuilder.tag_dispatch(a, &td);
-    const fsm = fsm_opt.?;
+    var td = try tagDispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, false, &.{});
+    defer td.deinit(a);
+    var fsm = (try GrammarFsmBuilder.tagDispatch(a, &td)).?;
+    defer fsm.deinit();
     const expected = "FSM(num_states=11, start=0, end=[0, 1, 2, 5, 6, 8, 9, 10], edges=[" ++
         "\n0: [[\\0-g]->0, 'h'->1, [i-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
         "\n1: [[\\0-d]->0, 'e'->2, [f-g]->0, 'h'->1, 'i'->4, [j-\\xe4]->0, '\\xe5'->5, [\\xe6-\\xff]->0]" ++
@@ -477,7 +465,7 @@ test "test_tag_dispatch_fsm_builder2" {
         "\n9: []" ++
         "\n10: []" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -485,10 +473,11 @@ test "test_tag_dispatch_fsm_builder3" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    const td = try tag_dispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, true, &.{ "hos", "eos" });
-    const fsm_opt = try GrammarFsmBuilder.tag_dispatch(a, &td);
-    const fsm = fsm_opt.?;
-    const printed = try fsm.to_string_repr();
+    var td = try tagDispatch(a, &.{ .{ "hel", "1" }, .{ "hi", "2" }, .{ "哈", "3" } }, true, &.{ "hos", "eos" });
+    defer td.deinit(a);
+    var fsm = (try GrammarFsmBuilder.tagDispatch(a, &td)).?;
+    defer fsm.deinit();
+    const printed = try fsm.toStringRepr(a);
     try std.testing.expect(std.mem.indexOf(u8, printed, "Rule(1)->0") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "Rule(2)->0") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "Rule(3)->0") != null);
@@ -498,13 +487,15 @@ test "test_token_tag_dispatch_fsm_builder" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    var ttd = TokenTagDispatch.empty();
+    var ttd: TokenTagDispatch = .empty;
+    defer ttd.deinit(a);
     try ttd.trigger_rule_pairs.append(a, .{ .token_id = 3, .rule_id = 1 });
     try ttd.trigger_rule_pairs.append(a, .{ .token_id = 5, .rule_id = 2 });
     ttd.loop_after_dispatch = false;
     try ttd.excludes.append(a, 7);
-    var fsm = try GrammarFsmBuilder.token_tag_dispatch(a, &ttd);
-    const printed = try fsm.to_string_repr();
+    var fsm = try GrammarFsmBuilder.tokenTagDispatch(a, &ttd);
+    defer fsm.deinit();
+    const printed = try fsm.toStringRepr(a);
     try std.testing.expect(std.mem.indexOf(u8, printed, "Token(") != null);
     try std.testing.expect(std.mem.indexOf(u8, printed, "ExcludeToken(") != null);
 }
@@ -515,7 +506,8 @@ test "test_byte_string_fsm_builder1" {
     const a = ar.allocator();
     const data = [_]i32{ 'h', 'e', 'l', 'l', 'o' };
     const expr = GrammarExpr{ .ty = .ByteString, .data = &data };
-    var fsm = try GrammarFsmBuilder.byte_string(a, expr);
+    var fsm = try GrammarFsmBuilder.byteString(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=6, start=0, end=[5], edges=[" ++
         "\n0: ['h'->1]" ++
         "\n1: ['e'->2]" ++
@@ -524,7 +516,7 @@ test "test_byte_string_fsm_builder1" {
         "\n4: ['o'->5]" ++
         "\n5: []" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -535,7 +527,8 @@ test "test_byte_string_fsm_builder2" {
     var data: std.ArrayList(i32) = .empty;
     for ("你好") |byte| try data.append(a, byte);
     const expr = GrammarExpr{ .ty = .ByteString, .data = data.items };
-    var fsm = try GrammarFsmBuilder.byte_string(a, expr);
+    var fsm = try GrammarFsmBuilder.byteString(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=7, start=0, end=[6], edges=[" ++
         "\n0: ['\\xe4'->1]" ++
         "\n1: ['\\xbd'->2]" ++
@@ -545,7 +538,7 @@ test "test_byte_string_fsm_builder2" {
         "\n5: ['\\xbd'->6]" ++
         "\n6: []" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -555,12 +548,13 @@ test "test_rule_ref_fsm_builder" {
     const a = ar.allocator();
     const data = [_]i32{1};
     const expr = GrammarExpr{ .ty = .RuleRef, .data = &data };
-    var fsm = try GrammarFsmBuilder.rule_ref(a, expr);
+    var fsm = try GrammarFsmBuilder.ruleRef(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=2, start=0, end=[1], edges=[" ++
         "\n0: [Rule(1)->1]" ++
         "\n1: []" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -570,12 +564,13 @@ test "test_character_class_fsm_builder1" {
     const a = ar.allocator();
     const data = [_]i32{ 0, 'a', 'z', 'A', 'Z' };
     const expr = GrammarExpr{ .ty = .CharacterClass, .data = &data };
-    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    var fsm = try GrammarFsmBuilder.characterClass(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=2, start=0, end=[1], edges=[" ++
         "\n0: [[a-z]->1, [A-Z]->1]" ++
         "\n1: []" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -585,11 +580,12 @@ test "test_character_class_fsm_builder2" {
     const a = ar.allocator();
     const data = [_]i32{ 0, 'a', 'z', 'A', 'Z' };
     const expr = GrammarExpr{ .ty = .CharacterClassStar, .data = &data };
-    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    var fsm = try GrammarFsmBuilder.characterClass(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=1, start=0, end=[0], edges=[" ++
         "\n0: [[a-z]->0, [A-Z]->0]" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -599,7 +595,8 @@ test "test_character_class_fsm_builder3" {
     const a = ar.allocator();
     const data = [_]i32{ 1, 'a', 'z', 'A', 'Z' };
     const expr = GrammarExpr{ .ty = .CharacterClass, .data = &data };
-    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    var fsm = try GrammarFsmBuilder.characterClass(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=16, start=0, end=[1], edges=[" ++
         "\n0: [[\\0-@]->1, [[-`]->1, [{-\\x7f]->1, [\\xc2-\\xdf]->2, '\\xe0'->3, [\\xe1-\\xef]->5, '\\xf0'->7, '\\xf4'->10, [\\xf1-\\xf3]->13]" ++
         "\n1: []" ++
@@ -618,7 +615,7 @@ test "test_character_class_fsm_builder3" {
         "\n14: [[\\x80-\\xbf]->15]" ++
         "\n15: [[\\x80-\\xbf]->1]" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -628,7 +625,8 @@ test "test_character_class_fsm_builder4" {
     const a = ar.allocator();
     const data = [_]i32{ 1, 'a', 'z', 'A', 'Z' };
     const expr = GrammarExpr{ .ty = .CharacterClassStar, .data = &data };
-    var fsm = try GrammarFsmBuilder.character_class(a, expr);
+    var fsm = try GrammarFsmBuilder.characterClass(a, expr);
+    defer fsm.deinit();
     const expected = "FSM(num_states=15, start=0, end=[0], edges=[" ++
         "\n0: [[\\0-@]->0, [[-`]->0, [{-\\x7f]->0, [\\xc2-\\xdf]->1, '\\xe0'->2, [\\xe1-\\xef]->4, '\\xf0'->6, '\\xf4'->9, [\\xf1-\\xf3]->12]" ++
         "\n1: [[\\x80-\\xbf]->0]" ++
@@ -646,7 +644,7 @@ test "test_character_class_fsm_builder4" {
         "\n13: [[\\x80-\\xbf]->14]" ++
         "\n14: [[\\x80-\\xbf]->0]" ++
         "\n])";
-    const actual = try fsm.to_string_repr();
+    const actual = try fsm.toStringRepr(a);
     try std.testing.expectEqualStrings(expected, actual);
 }
 
@@ -654,8 +652,9 @@ test "test_sequence_fsm_builder" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    var diag: @import("../parser/ebnf_error.zig").EbnfErrorInfo = undefined;
-    const grammar = try functor_mod.grammar_normalizer_mod.from_ebnf(
+    var diag: Diagnostic = .{};
+    defer diag.deinit(a);
+    var grammar = try functor_mod.fromEbnf(
         a,
         "root ::= rule1 rule2 rule3\n" ++
             "rule1 ::= \"a\" [a-z]* rule3\n" ++
@@ -664,8 +663,10 @@ test "test_sequence_fsm_builder" {
         "root",
         &diag,
     );
+    defer grammar.deinit();
 
-    const root = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.root_rule().body_expr_id), grammar);
+    var root = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rootRule().body_expr_id), &grammar);
+    defer root.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=4, start=2, end=[3], edges=[" ++
             "\n0: [Rule(2)->1]" ++
@@ -673,20 +674,22 @@ test "test_sequence_fsm_builder" {
             "\n2: [Rule(1)->0]" ++
             "\n3: []" ++
             "\n])",
-        try root.to_string_repr(),
+        try root.toStringRepr(a),
     );
 
-    const rule1 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(1).body_expr_id), grammar);
+    var rule1 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(1).body_expr_id), &grammar);
+    defer rule1.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=3, start=1, end=[2], edges=[" ++
             "\n0: [Rule(3)->2, [a-z]->0]" ++
             "\n1: ['a'->0]" ++
             "\n2: []" ++
             "\n])",
-        try rule1.to_string_repr(),
+        try rule1.toStringRepr(a),
     );
 
-    const rule2 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(2).body_expr_id), grammar);
+    var rule2 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(2).body_expr_id), &grammar);
+    defer rule2.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=4, start=2, end=[3], edges=[" ++
             "\n0: [[A-Z]->1]" ++
@@ -694,17 +697,18 @@ test "test_sequence_fsm_builder" {
             "\n2: ['c'->0]" ++
             "\n3: []" ++
             "\n])",
-        try rule2.to_string_repr(),
+        try rule2.toStringRepr(a),
     );
 
-    const rule3 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(3).body_expr_id), grammar);
+    var rule3 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(3).body_expr_id), &grammar);
+    defer rule3.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=3, start=1, end=[2], edges=[" ++
             "\n0: [Rule(3)->2]" ++
             "\n1: ['a'->0]" ++
             "\n2: []" ++
             "\n])",
-        try rule3.to_string_repr(),
+        try rule3.toStringRepr(a),
     );
 }
 
@@ -712,8 +716,9 @@ test "test_choices_fsm_builder" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    var diag: @import("../parser/ebnf_error.zig").EbnfErrorInfo = undefined;
-    const grammar = try functor_mod.grammar_normalizer_mod.from_ebnf(
+    var diag: Diagnostic = .{};
+    defer diag.deinit(a);
+    var grammar = try functor_mod.fromEbnf(
         a,
         "root ::= rule1 | rule2\n" ++
             "rule1 ::= \"\" | \"hello\" rule2\n" ++
@@ -721,18 +726,21 @@ test "test_choices_fsm_builder" {
         "root",
         &diag,
     );
+    defer grammar.deinit();
 
-    const root = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.root_rule().body_expr_id), grammar);
+    var root = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rootRule().body_expr_id), &grammar);
+    defer root.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=3, start=0, end=[1, 2], edges=[" ++
             "\n0: [Rule(1)->1, Rule(2)->2]" ++
             "\n1: []" ++
             "\n2: []" ++
             "\n])",
-        try root.to_string_repr(),
+        try root.toStringRepr(a),
     );
 
-    const rule1 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(1).body_expr_id), grammar);
+    var rule1 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(1).body_expr_id), &grammar);
+    defer rule1.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=7, start=0, end=[0, 6], edges=[" ++
             "\n0: ['h'->2]" ++
@@ -743,10 +751,11 @@ test "test_choices_fsm_builder" {
             "\n5: ['o'->1]" ++
             "\n6: []" ++
             "\n])",
-        try rule1.to_string_repr(),
+        try rule1.toStringRepr(a),
     );
 
-    const rule2 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(2).body_expr_id), grammar);
+    var rule2 = try GrammarFsmBuilder.choices(a, grammar.expr(grammar.rule(2).body_expr_id), &grammar);
+    defer rule2.deinit();
     try std.testing.expectEqualStrings(
         "FSM(num_states=4, start=1, end=[0], edges=[" ++
             "\n0: []" ++
@@ -754,7 +763,7 @@ test "test_choices_fsm_builder" {
             "\n2: ['A'->0, [a-z]->2]" ++
             "\n3: [Rule(2)->0]" ++
             "\n])",
-        try rule2.to_string_repr(),
+        try rule2.toStringRepr(a),
     );
 }
 
@@ -762,72 +771,72 @@ test "test_regex_build_with_forbidden_chars" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    // \S matches any non-whitespace byte. With the JSON forbidden characters removed, the
-    // quote and the backslash must be rejected while other printable characters stay.
-    const forbidden = GrammarFsmBuilder.json_string_forbidden_chars();
     const T = struct {
         fn buildForbidden(al: A, regex: []const u8) !FsmWithStartEnd {
-            return RegexFsmBuilder.build_with_forbidden_chars(al, regex, GrammarFsmBuilder.json_string_forbidden_chars(), null, "", null);
+            return RegexFsmBuilder.buildWithForbiddenChars(al, regex, GrammarFsmBuilder.jsonStringForbiddenChars(), null, "", null);
         }
     };
-    _ = forbidden;
+
     var m1 = try T.buildForbidden(a, "\\S+");
-    try std.testing.expect(try m1.accept_string("abc"));
-    try std.testing.expect(try m1.accept_string("a!~z"));
-    try std.testing.expect(!try m1.accept_string("a\"b"));
-    try std.testing.expect(!try m1.accept_string("a\\b"));
-    try std.testing.expect(!try m1.accept_string("a b"));
+    defer m1.deinit();
+    try std.testing.expect(try m1.acceptString("abc"));
+    try std.testing.expect(try m1.acceptString("a!~z"));
+    try std.testing.expect(!try m1.acceptString("a\"b"));
+    try std.testing.expect(!try m1.acceptString("a\\b"));
+    try std.testing.expect(!try m1.acceptString("a b"));
 
-    // A positive class spanning the quote and the backslash is split around them.
     var m2 = try T.buildForbidden(a, "[ -~]+");
-    try std.testing.expect(try m2.accept_string("A z!"));
-    try std.testing.expect(!try m2.accept_string("\""));
-    try std.testing.expect(!try m2.accept_string("\\"));
+    defer m2.deinit();
+    try std.testing.expect(try m2.acceptString("A z!"));
+    try std.testing.expect(!try m2.acceptString("\""));
+    try std.testing.expect(!try m2.acceptString("\\"));
 
-    // . matches any byte; the control characters must be rejected as well.
     var m3 = try T.buildForbidden(a, ".");
-    try std.testing.expect(try m3.accept_string("a"));
-    try std.testing.expect(!try m3.accept_string("\t"));
-    try std.testing.expect(!try m3.accept_string("\n"));
-    try std.testing.expect(!try m3.accept_string("\""));
+    defer m3.deinit();
+    try std.testing.expect(try m3.acceptString("a"));
+    try std.testing.expect(!try m3.acceptString("\t"));
+    try std.testing.expect(!try m3.acceptString("\n"));
+    try std.testing.expect(!try m3.acceptString("\""));
 
-    // Epsilon transitions are preserved: the pattern still accepts the empty string.
     var m4 = try T.buildForbidden(a, "(ab)*");
-    try std.testing.expect(try m4.accept_string(""));
-    try std.testing.expect(try m4.accept_string("abab"));
-    try std.testing.expect(!try m4.accept_string("a"));
+    defer m4.deinit();
+    try std.testing.expect(try m4.acceptString(""));
+    try std.testing.expect(try m4.acceptString("abab"));
+    try std.testing.expect(!try m4.acceptString("a"));
 
-    // A pattern that requires a forbidden character becomes the empty language.
     var m5 = try T.buildForbidden(a, "a\"b");
-    try std.testing.expect(!try m5.accept_string("a\"b"));
-    try std.testing.expect(!try m5.accept_string("ab"));
-    try std.testing.expect(!try m5.accept_string(""));
+    defer m5.deinit();
+    try std.testing.expect(!try m5.acceptString("a\"b"));
+    try std.testing.expect(!try m5.acceptString("ab"));
+    try std.testing.expect(!try m5.acceptString(""));
 
-    // Multi-byte UTF-8 characters (bytes >= 0x80) are not affected by the JSON exclusion.
     var m6 = try T.buildForbidden(a, ".+");
-    try std.testing.expect(try m6.accept_string("你好"));
+    defer m6.deinit();
+    try std.testing.expect(try m6.acceptString("你好"));
 }
 
 test "test_regex_build_with_forbidden_chars_preserves_repeat_aux_data" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    var builder = try grammar_mod.GrammarBuilder.new(a);
+    var builder = try GrammarBuilder.init(a);
+    defer builder.deinit();
 
-    var m = try RegexFsmBuilder.build_with_forbidden_chars(a, "[^\n\r]{1,129}", GrammarFsmBuilder.json_string_forbidden_chars(), &builder, "", null);
-    const fsm = m.get_fsm();
-    const aux_data = fsm.edge_aux_data_slice();
+    var m = try RegexFsmBuilder.buildWithForbiddenChars(a, "[^\n\r]{1,129}", GrammarFsmBuilder.jsonStringForbiddenChars(), &builder, "", null);
+    defer m.deinit();
+    const fsm = m.getFsm();
+    const aux_data = fsm.edgeAuxDataSlice();
     try std.testing.expect(aux_data.len != 0);
 
     var found_repeat_edge = false;
-    for (0..@intCast(fsm.num_states())) |state| {
-        for (fsm.state_edges(@intCast(state))) |edge| {
-            if (!edge.is_repeat_ref()) continue;
+    for (0..@intCast(fsm.numStates())) |state| {
+        for (fsm.stateEdges(@intCast(state))) |edge| {
+            if (!edge.isRepeatRef()) continue;
             found_repeat_edge = true;
-            try std.testing.expect(edge.aux_index() >= 0);
-            try std.testing.expect(edge.aux_index() + 2 < @as(i32, @intCast(aux_data.len)));
+            try std.testing.expect(edge.auxIndex() >= 0);
+            try std.testing.expect(edge.auxIndex() + 2 < @as(i32, @intCast(aux_data.len)));
 
-            const repeat_info = fsm.repeat_edge_info(edge.aux_index());
+            const repeat_info = fsm.repeatEdgeInfo(edge.auxIndex());
             try std.testing.expectEqual(@as(i32, 1), repeat_info.lower());
             try std.testing.expectEqual(@as(i32, 129), repeat_info.upper());
         }
@@ -839,28 +848,29 @@ test "test_grammar_fsm_builder_regex" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
-    // The compiled regex automaton must preserve the language after simplification.
+
     var m1 = try GrammarFsmBuilder.regex(a, "(ab)+", false, null);
-    try std.testing.expect(!try m1.accept_string(""));
-    try std.testing.expect(!try m1.accept_string("a"));
-    try std.testing.expect(try m1.accept_string("ab"));
-    try std.testing.expect(try m1.accept_string("abab"));
+    defer m1.deinit();
+    try std.testing.expect(!try m1.acceptString(""));
+    try std.testing.expect(!try m1.acceptString("a"));
+    try std.testing.expect(try m1.acceptString("ab"));
+    try std.testing.expect(try m1.acceptString("abab"));
 
     var m2 = try GrammarFsmBuilder.regex(a, "[0-9]{5}$", false, null);
-    try std.testing.expect(try m2.accept_string("12345"));
-    try std.testing.expect(!try m2.accept_string("1234"));
-    try std.testing.expect(!try m2.accept_string("123456"));
+    defer m2.deinit();
+    try std.testing.expect(try m2.acceptString("12345"));
+    try std.testing.expect(!try m2.acceptString("1234"));
+    try std.testing.expect(!try m2.acceptString("123456"));
 
-    // json_string excludes the JSON forbidden characters.
     var m3 = try GrammarFsmBuilder.regex(a, "\\S+", true, null);
-    try std.testing.expect(try m3.accept_string("abc"));
-    try std.testing.expect(!try m3.accept_string("a\"b"));
-    try std.testing.expect(!try m3.accept_string("a\\b"));
+    defer m3.deinit();
+    try std.testing.expect(try m3.acceptString("abc"));
+    try std.testing.expect(!try m3.acceptString("a\"b"));
+    try std.testing.expect(!try m3.acceptString("a\\b"));
 
-    // Without the flag, the quote is accepted.
     var m4 = try GrammarFsmBuilder.regex(a, "\\S+", false, null);
-    try std.testing.expect(try m4.accept_string("a\"b"));
+    defer m4.deinit();
+    try std.testing.expect(try m4.acceptString("a\"b"));
 
-    // Invalid patterns report an error.
     try std.testing.expectError(error.RegexParse, GrammarFsmBuilder.regex(a, "+a", false, null));
 }

@@ -1,13 +1,14 @@
 //! Thread-safe LRU cache for crossing-grammar adaptive token masks (`rule_level_cache.rs`).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const adaptive_token_mask = @import("adaptive_token_mask.zig");
-const AdaptiveTokenMask = adaptive_token_mask.AdaptiveTokenMask;
-const support = @import("../support/mod.zig");
+const AdaptiveTokenMask = @import("AdaptiveTokenMask.zig").AdaptiveTokenMask;
+const support = @import("../support.zig");
 const AutoLruCache = support.AutoLruCache;
-const hash_combine = support.hash_combine;
+const ThreadSafeAllocator = support.ThreadSafeAllocator;
+const hashCombine = support.hashCombine;
 
 /// Unlimited cache size sentinel (matches C++ `kUnlimitedSize`).
 pub const UNLIMITED_SIZE: usize = std.math.maxInt(usize);
@@ -45,19 +46,15 @@ const CacheState = struct {
         };
     }
 
-    fn deinit(self: *CacheState, alloc_mutex: *std.atomic.Mutex) void {
-        self.clear(alloc_mutex);
-        lockMutex(alloc_mutex);
-        defer alloc_mutex.unlock();
+    fn deinit(self: *CacheState) void {
+        self.clear();
         self.lru.deinit(self.allocator);
     }
 
-    fn clear(self: *CacheState, alloc_mutex: *std.atomic.Mutex) void {
-        lockMutex(alloc_mutex);
-        defer alloc_mutex.unlock();
+    fn clear(self: *CacheState) void {
         while (self.lru.popLru()) |entry| {
             var mask = entry.value;
-            mask.deinit();
+            mask.deinit(self.allocator);
         }
         self.lru.clearRetainingCapacity();
         self.current_cache_memory_size = 0;
@@ -78,12 +75,11 @@ const CacheState = struct {
             .edge_cnt = edge_cnt,
         };
         const mask = self.lru.getPtr(key) orelse return null;
-        return try mask.clone(out_allocator);
+        return try mask.dupe(out_allocator);
     }
 
     fn add(
         self: *CacheState,
-        alloc_mutex: *std.atomic.Mutex,
         fsm_hash: u64,
         fsm_new_node_id: i32,
         state_cnt: i32,
@@ -96,7 +92,7 @@ const CacheState = struct {
             .state_cnt = state_cnt,
             .edge_cnt = edge_cnt,
         };
-        const new_item_size = token_mask.memory_size_bytes();
+        const new_item_size = token_mask.memorySizeBytes();
         if (self.max_cache_memory_size != UNLIMITED_SIZE and new_item_size > self.max_cache_memory_size) {
             return false;
         }
@@ -104,26 +100,23 @@ const CacheState = struct {
             return false;
         }
 
-        lockMutex(alloc_mutex);
-        defer alloc_mutex.unlock();
-
         if (self.max_cache_memory_size != UNLIMITED_SIZE) {
             while (@as(i128, self.current_cache_memory_size) >
                 @as(i128, self.max_cache_memory_size) - @as(i128, new_item_size))
             {
                 const oldest = self.lru.popLru() orelse break;
                 var removed_mask = oldest.value;
-                self.current_cache_memory_size -= @as(i64, @intCast(removed_mask.memory_size_bytes()));
-                removed_mask.deinit();
+                self.current_cache_memory_size -= @as(i64, @intCast(removed_mask.memorySizeBytes()));
+                removed_mask.deinit(self.allocator);
             }
         }
 
-        var stored = try token_mask.clone(self.allocator);
-        errdefer stored.deinit();
+        var stored = try token_mask.dupe(self.allocator);
+        errdefer stored.deinit(self.allocator);
         if (try self.lru.put(self.allocator, key, stored)) |prev| {
             var prev_mask = prev.value;
-            self.current_cache_memory_size -= @as(i64, @intCast(prev_mask.memory_size_bytes()));
-            prev_mask.deinit();
+            self.current_cache_memory_size -= @as(i64, @intCast(prev_mask.memorySizeBytes()));
+            prev_mask.deinit(self.allocator);
         }
         self.current_cache_memory_size += @as(i64, @intCast(new_item_size));
         return true;
@@ -143,51 +136,79 @@ const Shard = struct {
     }
 };
 
+fn isStatelessAllocator(a: Allocator) bool {
+    if (a.vtable == std.testing.failing_allocator.vtable) return true;
+    if (builtin.link_libc and a.vtable == std.heap.c_allocator.vtable) return true;
+    if (!builtin.single_threaded and a.vtable == std.heap.smp_allocator.vtable) return true;
+    return false;
+}
+
 /// Thread-safe LRU cache keyed by `(fsm_hash, new_state_id, state_cnt, edge_cnt)`, sharded by
 /// `(fsm_hash, new_state_id)`. Eviction is performed per shard, each owning an equal share of the
 /// memory budget.
+///
+/// Internal allocations are serialized through an embedded `ThreadSafeAllocator` wrapping
+/// `backing_allocator` so concurrent reads/evictions/inserts across shards cannot race.
 pub const RuleLevelCache = struct {
-    allocator: Allocator,
-    alloc_mutex: std.atomic.Mutex,
+    backing_allocator: Allocator,
+    ts_alloc: ThreadSafeAllocator,
     shards: [NUM_SHARDS]Shard,
     max_cache_memory_size: usize,
 
     /// Creates a heap-allocated cache with the given memory budget (`UNLIMITED_SIZE` = unlimited).
-    pub fn new(allocator: Allocator, max_cache_memory_size: usize) Allocator.Error!*RuleLevelCache {
+    pub fn init(allocator: Allocator, max_cache_memory_size: usize) Allocator.Error!*RuleLevelCache {
         const shard_max_size = if (max_cache_memory_size == UNLIMITED_SIZE)
             UNLIMITED_SIZE
         else
             max_cache_memory_size / NUM_SHARDS;
         const self = try allocator.create(RuleLevelCache);
-        self.allocator = allocator;
-        self.alloc_mutex = .unlocked;
-        self.max_cache_memory_size = max_cache_memory_size;
+        self.* = .{
+            .backing_allocator = allocator,
+            .ts_alloc = .{ .child = allocator },
+            .shards = undefined,
+            .max_cache_memory_size = max_cache_memory_size,
+        };
+        const ts = self.ts_alloc.allocator();
         for (&self.shards) |*s| {
             s.* = .{
                 .mutex = .unlocked,
-                .state = CacheState.init(allocator, shard_max_size),
+                .state = CacheState.init(ts, shard_max_size),
             };
         }
         return self;
     }
 
     pub fn deinit(self: *RuleLevelCache) void {
-        const a = self.allocator;
+        const a = self.backing_allocator;
         for (&self.shards) |*s| {
-            s.state.deinit(&self.alloc_mutex);
+            s.state.deinit();
         }
         a.destroy(self);
     }
 
-    fn shard_for(self: *RuleLevelCache, fsm_hash: u64, fsm_new_node_id: i32) *Shard {
+    /// Returns a mutex-serialized allocator view backed by `self.backing_allocator`.
+    /// Sharing this allocator with worker threads prevents concurrent races on non-thread-safe
+    /// backing allocators such as `std.testing.allocator`.
+    pub fn threadSafeAllocator(self: *RuleLevelCache) Allocator {
+        return self.ts_alloc.allocator();
+    }
+
+    /// Whether `other` refers to the same backing allocator instance as `self`.
+    pub fn sharesBackingAllocator(self: *const RuleLevelCache, other: Allocator) bool {
+        if (self.backing_allocator.vtable != other.vtable) return false;
+        if (isStatelessAllocator(other)) return true;
+        return self.backing_allocator.ptr == other.ptr;
+    }
+
+    fn shardFor(self: *RuleLevelCache, fsm_hash: u64, fsm_new_node_id: i32) *Shard {
         // Match Rust `fsm_new_node_id as u64` sign extension.
         const node_u64: u64 = @bitCast(@as(i64, fsm_new_node_id));
-        const index = hash_combine(&.{ fsm_hash, node_u64 }) % NUM_SHARDS;
+        const index = hashCombine(&.{ fsm_hash, node_u64 }) % NUM_SHARDS;
         return &self.shards[index];
     }
 
     /// Returns a cloned cached adaptive token mask in `out_allocator`, if present.
-    pub fn get_cache(
+    pub fn getCache(
         self: *RuleLevelCache,
         out_allocator: Allocator,
         fsm_hash: u64,
@@ -195,14 +216,14 @@ pub const RuleLevelCache = struct {
         state_cnt: i32,
         edge_cnt: i32,
     ) Allocator.Error!?AdaptiveTokenMask {
-        const s = self.shard_for(fsm_hash, fsm_new_node_id);
+        const s = self.shardFor(fsm_hash, fsm_new_node_id);
         s.lock();
         defer s.unlock();
         return s.state.get(out_allocator, fsm_hash, fsm_new_node_id, state_cnt, edge_cnt);
     }
 
     /// Inserts an adaptive token mask into the cache (deep-copied into the cache's allocator).
-    pub fn add_cache(
+    pub fn addCache(
         self: *RuleLevelCache,
         fsm_hash: u64,
         fsm_new_node_id: i32,
@@ -210,23 +231,27 @@ pub const RuleLevelCache = struct {
         edge_cnt: i32,
         token_mask: *const AdaptiveTokenMask,
     ) Allocator.Error!bool {
-        const s = self.shard_for(fsm_hash, fsm_new_node_id);
+        const s = self.shardFor(fsm_hash, fsm_new_node_id);
         s.lock();
         defer s.unlock();
-        return s.state.add(&self.alloc_mutex, fsm_hash, fsm_new_node_id, state_cnt, edge_cnt, token_mask);
+        return s.state.add(fsm_hash, fsm_new_node_id, state_cnt, edge_cnt, token_mask);
     }
 
     /// Clears all cached entries.
-    pub fn clear_cache(self: *RuleLevelCache) void {
+    pub fn clearCache(self: *RuleLevelCache) void {
         for (&self.shards) |*s| {
             s.lock();
             defer s.unlock();
-            s.state.clear(&self.alloc_mutex);
+            s.state.clear();
         }
     }
 
     /// The configured memory budget (`UNLIMITED_SIZE` = unlimited).
-    pub fn max_size(self: *const RuleLevelCache) usize {
+    pub fn maxSize(self: *const RuleLevelCache) usize {
         return self.max_cache_memory_size;
     }
 };
+
+test {
+    std.testing.refAllDecls(RuleLevelCache);
+}
